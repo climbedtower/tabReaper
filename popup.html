@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>tabReaper</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>tabReaper</h1>
+    
+    <div class="controls">
+      <button id="fetchBtn" class="btn-primary">全タブ取得</button>
+      <button id="copyBtn" class="btn-secondary" disabled>選択をコピー</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div id="tabList" class="tab-list"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

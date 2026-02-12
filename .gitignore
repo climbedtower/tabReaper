@@ -1,0 +1,17 @@
+# Environment files
+.env
+config.js
+config.local.js
+
+# System files
+.DS_Store
+
+# Logs
+*.log
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
