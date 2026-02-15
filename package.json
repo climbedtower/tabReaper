@@ -1,0 +1,21 @@
+{
+  "name": "tabreaper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch"
+  },
+  "dependencies": {
+    "@pipelines/url-summary": "file:../pipelines/url-summary",
+    "ai-roles": "file:../pipelines/ai-roles",
+    "call-ai": "file:../pipelines/call-ai"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^28.0.0",
+    "@types/chrome": "^0.0.260",
+    "typescript": "^5.0.0",
+    "vite": "^5.0.0"
+  }
+}

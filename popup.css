@@ -26,8 +26,21 @@ h1 {
 
 .controls {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.link-settings {
+  font-size: 13px;
+  color: #007aff;
+  text-decoration: none;
+  margin-right: auto;
+}
+
+.link-settings:hover {
+  text-decoration: underline;
 }
 
 button {
@@ -116,6 +129,23 @@ button:disabled {
 .window-header input[type="checkbox"] {
   width: 16px;
   height: 16px;
+}
+
+.window-label-editable {
+  outline: none;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+.window-label-editable:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+.window-label-editable:focus {
+  background: #fff;
+  box-shadow: 0 0 0 1px #007aff;
+}
+.window-tab-count {
+  color: #666;
+  font-weight: 500;
 }
 
 .tab-item {

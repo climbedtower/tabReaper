@@ -3,9 +3,12 @@
   "version": "0.1.0",
   "manifest_version": 3,
   "description": "全ウィンドウ・タブを構造化リストで取得し、選択して保存できる拡張機能",
-  "permissions": ["tabs", "scripting", "downloads"],
+  "permissions": ["tabs", "scripting", "downloads", "storage"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html"
   }
 }
