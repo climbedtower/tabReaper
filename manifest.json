@@ -1,9 +1,9 @@
 {
   "name": "tabReaper",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "manifest_version": 3,
-  "description": "全ウィンドウ・タブを構造化リストで取得し、選択して保存できる拡張機能",
-  "permissions": ["tabs", "scripting", "downloads", "storage"],
+  "description": "全ウィンドウ・タブを構造化リストで取得し、Obsidian Vaultに直接保存できる拡張機能",
+  "permissions": ["tabs", "scripting", "storage"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html"

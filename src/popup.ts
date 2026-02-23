@@ -1,5 +1,6 @@
 /**
  * tabReaper popup - URL要約は @pipelines/url-summary 経由。担当AIは ai-roles の worker。
+ * ファイル保存は Obsidian Local REST API 経由。
  */
 
 import {
@@ -18,16 +19,31 @@ import {
   type AIProvider,
 } from "ai-roles";
 import { callAI } from "call-ai";
+import {
+  loadRestConfig,
+  healthCheck,
+  putVaultFile,
+  appendVaultFile,
+  type ObsidianRestConfig,
+} from "./obsidian-rest";
 
-const TO_OBSIDIAN_WEB_SUMMARY = "toObsidian/web_summary";
-const TO_OBSIDIAN_CLIP = "toObsidian/webclip";
-const TO_OBSIDIAN_RAW_CONTENT = "toObsidian/raw_content";
-/** 要約 md の raw_content に書くヴォルト相対パス（toObsidian/raw_content のシンボリックリンク先に合わせる） */
+const VAULT_CLIP_DIR = "library/clip";
+const VAULT_RAW_DIR = "memory/raw_content";
 const RAW_CONTENT_PATH_PREFIX = "memory/raw_content";
 const SHORT_TITLE_MAX_LEN = 60;
 const WINDOW_LABEL_MAX_LEN = 40;
 
 const TWITTER_HOST_RE = /^(https?:\/\/)?(www\.)?(twitter\.com|x\.com)(\/|$)/i;
+const YOUTUBE_HOST_RE = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)(\/|$)/i;
+
+type SourceType = "web" | "x" | "youtube" | "paper" | "blog";
+
+function detectSourceType(url: string): SourceType {
+  if (TWITTER_HOST_RE.test(url)) return "x";
+  if (YOUTUBE_HOST_RE.test(url)) return "youtube";
+  if (/\.pdf(\?|#|$)/i.test(url)) return "paper";
+  return "web";
+}
 
 function isTwitterUrl(url: string): boolean {
   try {
@@ -467,37 +483,55 @@ function appendUrlsToPointsSection(md: string, urls: string[]): string {
   return md.slice(0, insertAt) + "\n" + lines + md.slice(insertAt);
 }
 
-function buildPlaceholderSummaryMd(tab: TabInfo, rawContentPath?: string): string {
-  const created = new Date().toISOString();
-  const pageTitle = (tab.title || "").trim() || "（無題）";
+function todayDate(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function buildClipFrontmatter(opts: {
+  url: string;
+  rawContentPath: string;
+  windowLabel: string;
+  hasRaw: boolean;
+}): string {
+  const sourceType = detectSourceType(opts.url);
+  const rawPolicy = opts.hasRaw ? "stored" : "url_only";
+  return [
+    "---",
+    `source_type: ${sourceType}`,
+    `pipeline: summary`,
+    `raw_policy: ${rawPolicy}`,
+    `date: ${todayDate()}`,
+    `window: ${opts.windowLabel}`,
+    `url: ${opts.url}`,
+    `raw_content: ${opts.rawContentPath}`,
+    `linked_from: tabReaper`,
+    "---",
+  ].join("\n");
+}
+
+function buildPlaceholderSummaryMd(tab: TabInfo, rawContentPath?: string, windowLabel?: string): string {
   const rawLine = rawContentPath ?? "（未設定）";
+  const fm = buildClipFrontmatter({
+    url: tab.url,
+    rawContentPath: rawLine,
+    windowLabel: windowLabel ?? "",
+    hasRaw: rawContentPath != null && rawContentPath !== "（未設定）",
+  });
   const pointLines =
     (tab.extractedUrls?.length ?? 0) > 0
       ? "- （要約は未取得）\n" + tab.extractedUrls!.map((u) => "- " + u).join("\n")
       : "- （要約は未取得）";
-  return `---
-page_uid: ${uid8()}-${Date.now().toString(36)}
----
+  return `${fm}
 
 ## 要点
 ${pointLines}
 
 ## 要約
-（MVPでは空欄）
+（未取得）
 
 ### tags
 （未設定）
-
----
-url: ${tab.url}
-raw_content: ${rawLine}
-created_at: ${created}
-linked_from: tabReaper
-raw_pagetitle: ${pageTitle}
----
-
-## how_to
-（手順があるときだけ。なければ省略可）
 `;
 }
 
@@ -520,7 +554,7 @@ function addPlaceholderFilenames(
       if (!tab.uid8) tab.uid8 = uid;
       if (!tab.baseForFilename) tab.baseForFilename = base;
       tab.summaryFilename = `p-${base}_${uid}.md`;
-      tab.summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary);
+      tab.summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary, w.windowLabel);
     });
   });
 }
@@ -563,12 +597,12 @@ async function fetchTwitterThreadText(tabId: number): Promise<string | null> {
   }
 }
 
-/** 呼び出し元で重複チェック済みのタブのみ呼ぶ。本文取得の第一パスで tab.uid8 / baseForFilename / rawContentPathForSummary が設定されている前提 */
 async function runUrlSummaryForTab(
   tab: TabInfo,
   apiKey: string,
   provider: AIProvider,
-  modelId: string
+  modelId: string,
+  windowLabel: string,
 ): Promise<{ summaryFilename: string; summaryContent: string }> {
   const uid = tab.uid8 ?? uid8();
   const created = new Date().toISOString();
@@ -579,10 +613,13 @@ async function runUrlSummaryForTab(
   } else {
     text = await fetchViaJina(tab.url, 15000);
   }
+  const rawPath = tab.rawContentPathForSummary ?? "（未設定）";
+  const hasRaw = rawPath !== "（未設定）";
+  const fm = buildClipFrontmatter({ url: tab.url, rawContentPath: rawPath, windowLabel, hasRaw });
   const pageTitle = (tab.title || "").trim() || "（無題）";
   const program = {
     url: tab.url,
-    raw_content: tab.rawContentPathForSummary ?? "（未設定）",
+    raw_content: rawPath,
     created_at: created,
     linked_from: "tabReaper",
     raw_pagetitle: pageTitle,
@@ -599,19 +636,14 @@ async function runUrlSummaryForTab(
     });
     const json = parseSummaryJson(raw);
     const summaryBody = buildSummaryMdFromJson(json, program);
-    const pageUid = `${uid8()}-${Date.now().toString(36)}`;
-    let summaryContent = `---
-page_uid: ${pageUid}
----
-
-${summaryBody}`;
+    let summaryContent = `${fm}\n\n${summaryBody}`;
     summaryContent = appendUrlsToPointsSection(summaryContent, tab.extractedUrls ?? []);
     const base = getShortTitleForFilename(json.short_title) || generateShortTitle({ rawTitle: tab.title || "", url: tab.url });
     const summaryFilename = `p-${base}_${uid}.md`;
     return { summaryFilename, summaryContent };
   } catch {
     const summaryFilename = `p-untitled_${uid}.md`;
-    const summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary);
+    const summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary, windowLabel);
     return { summaryFilename, summaryContent };
   }
 }
@@ -712,40 +744,29 @@ async function refineAllWindowsLabelsOnFetch(): Promise<void> {
   }
 }
 
-function saveTabSummariesToDownloads(
+async function saveTabSummariesToVault(
+  cfg: ObsidianRestConfig,
   byWindow: { windowIndex: number; windowLabel: string; tabs: TabInfo[] }[]
 ) {
   const flat = byWindow.flatMap((w) => w.tabs).filter((t) => t.summaryFilename && t.summaryContent);
-  return Promise.all(
-    flat.map((tab) => {
-      const filename = `${TO_OBSIDIAN_WEB_SUMMARY}/${tab.summaryFilename!}`;
-      const content = tab.summaryContent!;
-      const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      return chrome.downloads.download({ url, filename, saveAs: false }).then(() => {
-        URL.revokeObjectURL(url);
-      });
-    })
-  );
+  for (const tab of flat) {
+    await putVaultFile(cfg, `${VAULT_CLIP_DIR}/${tab.summaryFilename!}`, tab.summaryContent!);
+  }
 }
 
-function saveRawToDownloads(
+async function saveRawToVault(
+  cfg: ObsidianRestConfig,
   byWindow: { windowIndex: number; windowLabel: string; tabs: TabInfo[] }[]
 ) {
   const flat = byWindow.flatMap((w) => w.tabs).filter((t) => t.rawFilename && t.rawContent);
-  return Promise.all(
-    flat.map((tab) => {
-      const filename = `${TO_OBSIDIAN_RAW_CONTENT}/${tab.rawFilename!}`;
-      const blob = new Blob([tab.rawContent!], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      return chrome.downloads.download({ url, filename, saveAs: false }).then(() => {
-        URL.revokeObjectURL(url);
-      });
-    })
-  );
+  for (const tab of flat) {
+    await putVaultFile(cfg, `${VAULT_RAW_DIR}/${tab.rawFilename!}`, tab.rawContent!, "text/markdown");
+  }
 }
 
-function buildJournalContent(
+const DAY_INDEX_PATH = "library/day-index.md";
+
+function buildDayIndexEntry(
   byWindow: { windowIndex: number; windowLabel: string; tabs: TabInfo[] }[],
   date: Date
 ): string {
@@ -755,45 +776,26 @@ function buildJournalContent(
     String(date.getMonth() + 1).padStart(2, "0") +
     "-" +
     String(date.getDate()).padStart(2, "0");
-  const lines = [`[[${ymd}]]`];
+  const lines: string[] = [`[[${ymd}]]`];
   byWindow.forEach((w) => {
+    lines.push(`- ${w.windowLabel}`);
     w.tabs.forEach((t) => {
       const link = t.summaryFilename
         ? `[[${t.summaryFilename.replace(/\.md$/i, "")}]]`
         : `[${t.title || "（無題）"}](${t.url})`;
-      lines.push(`- ${link}`);
+      lines.push(`\t- ${link}`);
     });
   });
   return lines.join("\n") + "\n";
 }
 
-function sanitizeWindowTitleForFilename(label: string): string {
-  return (label || "ウィンドウ1")
-    .replace(/\s+/g, "")
-    .replace(/[/\\:*?"<>|]/g, "_")
-    .slice(0, 40) || "ウィンドウ1";
-}
-
-function saveWindowListsToDownloads(
+async function appendDayIndex(
+  cfg: ObsidianRestConfig,
   byWindow: { windowIndex: number; windowLabel: string; tabs: TabInfo[] }[],
   date: Date
 ) {
-  const yyyymmdd =
-    date.getFullYear() +
-    String(date.getMonth() + 1).padStart(2, "0") +
-    String(date.getDate()).padStart(2, "0");
-  return Promise.all(
-    byWindow.map((w) => {
-      const windowTitle = sanitizeWindowTitleForFilename(w.windowLabel);
-      const filename = `${TO_OBSIDIAN_CLIP}/${yyyymmdd}-${windowTitle}.md`;
-      const content = buildJournalContent([w], date);
-      const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      return chrome.downloads
-        .download({ url, filename, saveAs: false })
-        .then(() => URL.revokeObjectURL(url));
-    })
-  );
+  const entry = buildDayIndexEntry(byWindow, date);
+  await appendVaultFile(cfg, DAY_INDEX_PATH, "\n" + entry);
 }
 
 async function saveSelectedTabs() {
@@ -801,6 +803,19 @@ async function saveSelectedTabs() {
     showStatus("タブを選択してください", "error");
     return;
   }
+
+  const restCfg = await loadRestConfig();
+  if (!restCfg) {
+    showStatus("Obsidian REST API Key が未設定です（設定画面で入力）", "error");
+    return;
+  }
+  showStatus("Obsidian 接続確認中...", "info");
+  const alive = await healthCheck(restCfg);
+  if (!alive) {
+    showStatus("Obsidian に接続できません（REST API プラグインが起動しているか確認）", "error");
+    return;
+  }
+
   const o = await chrome.storage.local.get([
     STORAGE_KEYS.apiKeyGemini,
     STORAGE_KEYS.apiKeyOpenAI,
@@ -855,9 +870,13 @@ async function saveSelectedTabs() {
     }
   }
 
+  const tabWindowLabel = new Map<number, string>();
+  byWindow.forEach((w) => w.tabs.forEach((t) => tabWindowLabel.set(t.id, w.windowLabel)));
+
   if (workerModel && apiKey) {
     for (let i = 0; i < flatTabs.length; i++) {
       const tab = flatTabs[i];
+      const wLabel = tabWindowLabel.get(tab.id) ?? "";
       const maxAttempts = 3;
       let succeeded = false;
       for (let attempt = 0; attempt < maxAttempts && !succeeded; attempt++) {
@@ -870,7 +889,8 @@ async function saveSelectedTabs() {
             tab,
             apiKey,
             workerModel!.provider,
-            workerModel!.modelId
+            workerModel!.modelId,
+            wLabel,
           );
           tab.summaryFilename = out.summaryFilename;
           tab.summaryContent = out.summaryContent;
@@ -879,7 +899,7 @@ async function saveSelectedTabs() {
           console.error(`URL要約エラー (attempt ${attempt + 1}/${maxAttempts}):`, tab.url, err);
           if (attempt === maxAttempts - 1) {
             tab.summaryFilename = `p-untitled_${tab.uid8 ?? uid8()}.md`;
-            tab.summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary);
+            tab.summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary, wLabel);
           }
         }
       }
@@ -888,12 +908,12 @@ async function saveSelectedTabs() {
     addPlaceholderFilenames(byWindow);
   }
 
-  showStatus("保存中...", "info");
+  showStatus("Obsidian に保存中...", "info");
   try {
-    await saveRawToDownloads(byWindow);
-    await saveTabSummariesToDownloads(byWindow);
-    await saveWindowListsToDownloads(byWindow, new Date());
-    showStatus("raw_content / web_summary / clip に保存しました", "success");
+    await saveRawToVault(restCfg, byWindow);
+    await saveTabSummariesToVault(restCfg, byWindow);
+    await appendDayIndex(restCfg, byWindow, new Date());
+    showStatus("library/clip/ に保存しました", "success");
     window.close();
   } catch (e) {
     showStatus(`保存エラー: ${(e as Error).message}`, "error");

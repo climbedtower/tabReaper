@@ -14,7 +14,24 @@
     </header>
 
     <section class="section">
-      <h2 class="section-title">APIキー</h2>
+      <h2 class="section-title">Obsidian 接続</h2>
+      <p class="lead-sub">Obsidian Local REST API プラグインの設定画面から API Key をコピーしてください。HTTP (Non-encrypted) モードを有効にしてください。</p>
+      <div class="key-row">
+        <label class="key-label" for="obsidianToken">REST API Key</label>
+        <input type="password" id="obsidianToken" class="key-input" placeholder="Obsidian REST API トークン" autocomplete="off" />
+        <span class="key-status" id="statusObsidian" aria-live="polite"></span>
+      </div>
+      <div class="key-row">
+        <label class="key-label" for="obsidianUrl">URL (任意)</label>
+        <input type="text" id="obsidianUrl" class="key-input" placeholder="http://127.0.0.1:27123" autocomplete="off" />
+        <span class="key-status" id="statusObsidianUrl" aria-live="polite"></span>
+      </div>
+      <button type="button" id="testConnectionBtn" class="btn-test">接続テスト</button>
+      <span class="message" id="connectionMessage" aria-live="polite"></span>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">APIキー（LLM要約用）</h2>
       <div class="key-row">
         <label class="key-label" for="apiKeyGemini">Gemini</label>
         <input type="password" id="apiKeyGemini" class="key-input" placeholder="AI Studio で発行" autocomplete="off" />

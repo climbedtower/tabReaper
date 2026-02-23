@@ -148,3 +148,25 @@ body {
 .message.error {
   color: #c62828;
 }
+
+.lead-sub {
+  font-size: 13px;
+  color: #666;
+  margin-bottom: 12px;
+}
+
+.btn-test {
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #007aff;
+  background: transparent;
+  border: 1px solid #007aff;
+  border-radius: 6px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+.btn-test:hover {
+  background: rgba(0, 122, 255, 0.06);
+}
