@@ -23,13 +23,16 @@ import {
   loadRestConfig,
   healthCheck,
   putVaultFile,
+  putVaultBinary,
   appendVaultFile,
   type ObsidianRestConfig,
 } from "./obsidian-rest";
 
 const VAULT_CLIP_DIR = "library/clip";
+const VAULT_REFERENCE_DIR = "library/reference";
 const VAULT_RAW_DIR = "memory/raw_content";
 const RAW_CONTENT_PATH_PREFIX = "memory/raw_content";
+const VAULT_IMAGE_DIR = "memory/raw_content/img";
 const SHORT_TITLE_MAX_LEN = 60;
 const WINDOW_LABEL_MAX_LEN = 40;
 
@@ -37,6 +40,7 @@ const TWITTER_HOST_RE = /^(https?:\/\/)?(www\.)?(twitter\.com|x\.com)(\/|$)/i;
 const YOUTUBE_HOST_RE = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)(\/|$)/i;
 
 type SourceType = "web" | "x" | "youtube" | "paper" | "blog";
+type ChatService = "chatgpt" | "claude" | "gemini";
 
 function detectSourceType(url: string): SourceType {
   if (TWITTER_HOST_RE.test(url)) return "x";
@@ -51,6 +55,14 @@ function isTwitterUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+function detectChatService(url: string): ChatService | null {
+  const u = (url || "").toLowerCase();
+  if (u.includes("chatgpt.com") || u.includes("chat.openai.com")) return "chatgpt";
+  if (u.includes("claude.ai")) return "claude";
+  if (u.includes("gemini.google.com")) return "gemini";
+  return null;
 }
 
 /**
@@ -136,12 +148,246 @@ function extractBodyTextAndLinksInPage(): { bodyText: string; links: string[] } 
   return { bodyText, links };
 }
 
+/**
+ * ページコンテキストで実行。ページ内の主要な画像・動画サムネイルURLを抽出して返す。
+ * Twitter/X: ツイート添付画像 + 動画poster
+ * YouTube: ページ or 埋め込みのサムネイル
+ * 一般サイト: 記事本文内の画像 + video poster + YouTube埋め込みサムネ
+ * executeScript に渡すため自己完結した関数にすること。
+ */
+function extractPageImagesInPage(): { src: string; alt: string; videoUrl?: string }[] {
+  const host = location.hostname.toLowerCase();
+  const isTwitter = host.includes("twitter.com") || host.includes("x.com");
+  const isYouTube = host.includes("youtube.com") || host.includes("youtu.be");
+
+  if (isYouTube) {
+    const match = location.href.match(/[?&]v=([^&#]+)/);
+    if (!match) return [];
+    const videoId = match[1];
+    return [{
+      src: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
+      alt: document.title || "YouTube動画",
+      videoUrl: location.href,
+    }];
+  }
+
+  if (isTwitter) {
+    const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+    if (articles.length === 0) return [];
+    const statusId = location.pathname.match(/\/status\/(\d+)/)?.[1] ?? null;
+    const targetArticle = statusId
+      ? articles.find((art) => art.querySelector(`a[href*="/status/${statusId}"]`)) ?? articles[0]
+      : articles[0];
+    const permalink =
+      (targetArticle.querySelector('a[href*="/status/"]') as HTMLAnchorElement | null)?.href || location.href;
+    const seen = new Set<string>();
+    const result: { src: string; alt: string; videoUrl?: string }[] = [];
+    let hasUncapturedVideo = false;
+
+    const allImgs = targetArticle.querySelectorAll("img");
+    for (const img of allImgs) {
+      const el = img as HTMLImageElement;
+      let src = el.src;
+      if (!src || src.startsWith("data:") || src.startsWith("blob:")) continue;
+      if (!src.includes("pbs.twimg.com")) continue;
+      if (src.includes("/profile_images/")) continue;
+      if (el.naturalWidth > 0 && el.naturalWidth < 64) continue;
+      if (el.naturalHeight > 0 && el.naturalHeight < 64) continue;
+      if (src.includes("name=")) src = src.replace(/name=\w+/, "name=large");
+      if (seen.has(src)) continue;
+      seen.add(src);
+      result.push({ src, alt: el.alt || "" });
+    }
+
+    const videoEls = targetArticle.querySelectorAll("video");
+    for (const v of videoEls) {
+      const el = v as HTMLVideoElement;
+      let captured = false;
+      if (el.readyState >= 2 && el.videoWidth > 0) {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = el.videoWidth;
+          canvas.height = el.videoHeight;
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.drawImage(el, 0, 0);
+            const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+            if (dataUrl && dataUrl.length > 1000) {
+              result.push({ src: dataUrl, alt: "動画スクショ", videoUrl: permalink });
+              captured = true;
+            }
+          }
+        } catch { /* CORS tainted canvas */ }
+      }
+      if (!captured) {
+        const poster = el.poster;
+        if (poster && !poster.startsWith("data:") && !seen.has(poster)) {
+          let src = poster;
+          if (src.includes("name=")) src = src.replace(/name=\w+/, "name=large");
+          seen.add(src);
+          result.push({ src, alt: "動画サムネイル", videoUrl: permalink });
+          captured = true;
+        }
+      }
+      if (!captured) hasUncapturedVideo = true;
+    }
+
+    if (hasUncapturedVideo) {
+      const ogImg = document.querySelector('meta[property="og:image"]');
+      const ogSrc = ogImg?.getAttribute("content");
+      if (ogSrc && !seen.has(ogSrc)) {
+        seen.add(ogSrc);
+        result.push({ src: ogSrc, alt: "動画サムネイル", videoUrl: permalink });
+      }
+    }
+
+    return result.slice(0, 10);
+  }
+
+  const main = document.querySelector("main");
+  const article = document.querySelector("article");
+  const contentRoot = main ?? article ?? document.body;
+  if (!contentRoot) return [];
+
+  const excludeSel =
+    "nav, header, footer, aside, [class*='sidebar'], [class*='menu'], [class*='ad-'], [class*='banner']";
+  const seen = new Set<string>();
+  const result: { src: string; alt: string; videoUrl?: string }[] = [];
+
+  const imgs = contentRoot.querySelectorAll("img");
+  for (const img of imgs) {
+    const el = img as HTMLImageElement;
+    if (!el.src || el.src.startsWith("data:")) continue;
+    if (el.closest(excludeSel)) continue;
+    if (el.naturalWidth > 0 && el.naturalWidth < 80) continue;
+    if (el.naturalHeight > 0 && el.naturalHeight < 80) continue;
+    const src = el.src;
+    if (seen.has(src)) continue;
+    seen.add(src);
+    result.push({ src, alt: el.alt || "" });
+  }
+
+  const ytIframes = contentRoot.querySelectorAll('iframe[src*="youtube.com/embed"]');
+  for (const iframe of ytIframes) {
+    const iframeSrc = (iframe as HTMLIFrameElement).src;
+    const m = iframeSrc.match(/youtube\.com\/embed\/([^?&#]+)/);
+    if (!m) continue;
+    const thumbUrl = `https://img.youtube.com/vi/${m[1]}/maxresdefault.jpg`;
+    if (seen.has(thumbUrl)) continue;
+    seen.add(thumbUrl);
+    result.push({ src: thumbUrl, alt: "YouTube動画", videoUrl: `https://www.youtube.com/watch?v=${m[1]}` });
+  }
+
+  const videos = contentRoot.querySelectorAll("video");
+  for (const v of videos) {
+    const el = v as HTMLVideoElement;
+    if (el.closest(excludeSel)) continue;
+    let captured = false;
+    if (el.readyState >= 2 && el.videoWidth > 0) {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = el.videoWidth;
+        canvas.height = el.videoHeight;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(el, 0, 0);
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+          if (dataUrl && dataUrl.length > 1000) {
+            const videoSrc = el.src || el.querySelector("source")?.src || "";
+            result.push({ src: dataUrl, alt: "動画スクショ", videoUrl: videoSrc || undefined });
+            captured = true;
+          }
+        }
+      } catch { /* CORS tainted canvas */ }
+    }
+    if (!captured) {
+      const poster = el.poster;
+      if (poster && !poster.startsWith("data:") && !seen.has(poster)) {
+        seen.add(poster);
+        const videoSrc = el.src || el.querySelector("source")?.src || "";
+        result.push({ src: poster, alt: "動画サムネイル", videoUrl: videoSrc || undefined });
+      }
+    }
+  }
+
+  return result.slice(0, 10);
+}
+
+/** ページコンテキストで実行。webchat から同期的にテキストを取得（待機・スクロールなし）。 */
+function extractWebchatInPage(): { service: string; rawText: string } {
+  const host = location.hostname.toLowerCase();
+  let service = "unknown";
+  if (host.includes("chatgpt.com") || host.includes("chat.openai.com")) service = "chatgpt";
+  else if (host.includes("claude.ai")) service = "claude";
+  else if (host.includes("gemini.google.com")) service = "gemini";
+  const main = document.querySelector("main");
+  const article = document.querySelector("article");
+  const el = main ?? article ?? document.body;
+  const rawText = (el as HTMLElement | null)?.innerText?.trim() ?? "";
+  return { service, rawText };
+}
+
 /** Content Script 注入不可または Discarded の場合は true */
 function isTabUninjectable(url: string, discarded: boolean): boolean {
   if (discarded) return true;
   if (!url || !url.startsWith("http")) return true;
   if (/^https?:\/\/chrome\.google\.com\/webstore\//i.test(url)) return true;
   return false;
+}
+
+/** 指定タブからページ内の画像・動画サムネURLを抽出 */
+async function fetchTabImages(
+  tabId: number,
+  url: string,
+  discarded: boolean,
+): Promise<{ src: string; alt: string; videoUrl?: string }[]> {
+  if (isTabUninjectable(url, discarded)) return [];
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: extractPageImagesInPage,
+    });
+    return (result?.[0]?.result as { src: string; alt: string; videoUrl?: string }[]) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** 画像URLからバイナリをダウンロード。失敗や巨大ファイルは null */
+async function downloadImage(
+  imageUrl: string,
+): Promise<{ data: ArrayBuffer; contentType: string; ext: string } | null> {
+  try {
+    const res = await fetch(imageUrl);
+    if (!res.ok) return null;
+    const ct = (res.headers.get("content-type") || "image/jpeg").split(";")[0].trim();
+    if (ct.includes("svg")) return null;
+    const data = await res.arrayBuffer();
+    if (data.byteLength > 5 * 1024 * 1024 || data.byteLength < 100) return null;
+    let ext = "jpg";
+    if (ct.includes("png")) ext = "png";
+    else if (ct.includes("gif")) ext = "gif";
+    else if (ct.includes("webp")) ext = "webp";
+    return { data, contentType: ct, ext };
+  } catch {
+    return null;
+  }
+}
+
+/** 要約mdの末尾に画像・動画サムネセクションを追記 */
+function appendImagesSectionToMd(
+  md: string,
+  images: { filename: string; alt: string; videoUrl?: string }[],
+): string {
+  if (images.length === 0) return md;
+  const lines: string[] = [];
+  for (const img of images) {
+    lines.push(`![[${img.filename}]]`);
+    if (img.videoUrl) {
+      lines.push(`[動画リンク](${img.videoUrl})`);
+    }
+  }
+  return `${md.trimEnd()}\n\n## 画像\n${lines.join("\n")}\n`;
 }
 
 /** ページで選択中のテキストを返す（executeScript 用・単体で注入される） */
@@ -225,6 +471,90 @@ async function fetchTabBodyAndLinks(
   }
 }
 
+function sanitizeChatText(raw: string): string {
+  return (raw || "").replace(/\r\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function cleanChatTurnText(raw: string): string {
+  const lines = (raw || "").split("\n");
+  const cleaned = lines
+    .map((l) => l.trimEnd())
+    .filter((l) => !/^(思考プロセスを表示|Gemini の回答|あなたのプロンプト|Gemini との会話|Gemini|Pro)\s*$/i.test(l.trim()));
+  return cleaned.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function extractTurnsFromRawText(raw: string): { role: string; text: string }[] {
+  const lines = sanitizeChatText(raw).split("\n");
+  const out: { role: string; text: string }[] = [];
+  let role: "User" | "Assistant" | null = null;
+  let buf: string[] = [];
+  const flush = () => {
+    const text = cleanChatTurnText(buf.join("\n"));
+    if (role && text) out.push({ role, text });
+    buf = [];
+  };
+  for (const line of lines) {
+    if (/^(あなたのプロンプト|You|User)\s*$/i.test(line.trim())) {
+      flush();
+      role = "User";
+      continue;
+    }
+    if (/^(Gemini の回答|Assistant|Claude|ChatGPT)\s*$/i.test(line.trim())) {
+      flush();
+      role = "Assistant";
+      continue;
+    }
+    if (role) buf.push(line);
+  }
+  flush();
+  return out;
+}
+
+function dedupeTurns(turns: { role: string; text: string }[]): { role: string; text: string }[] {
+  const seen = new Set<string>();
+  const out: { role: string; text: string }[] = [];
+  for (const t of turns) {
+    const text = (t.text || "").trim();
+    if (!text) continue;
+    const key = `${t.role}:${text.replace(/\s+/g, " ").trim()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ role: t.role, text });
+  }
+  return out;
+}
+
+async function fetchChatContent(
+  tabId: number,
+  url: string,
+  discarded: boolean
+): Promise<{ service: string; turns: { role: string; text: string }[]; rawText: string; extractionMeta: { domTurns: number } }> {
+  if (isTabUninjectable(url, discarded)) {
+    return { service: "unknown", turns: [], rawText: "", extractionMeta: { domTurns: 0 } };
+  }
+  try {
+    const extraction = chrome.scripting.executeScript({
+      target: { tabId },
+      func: extractWebchatInPage,
+    });
+    const timed = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("chat extraction timeout")), 5000)
+    );
+    const result = (await Promise.race([extraction, timed])) as chrome.scripting.InjectionResult[];
+    const data = result?.[0]?.result as { service?: string; rawText?: string } | undefined;
+    const rawText = sanitizeChatText(data?.rawText ?? "");
+    const turns = dedupeTurns(extractTurnsFromRawText(rawText));
+    return {
+      service: data?.service ?? "unknown",
+      turns,
+      rawText,
+      extractionMeta: { domTurns: 0 },
+    };
+  } catch {
+    return { service: "unknown", turns: [], rawText: "", extractionMeta: { domTurns: 0 } };
+  }
+}
+
 /** タイトルから装飾・サイト名を除去して内容のみ返す（" - Site" / " | Site" 等の後ろを落とす） */
 function contentOnlyTitle(title: string | null): string {
   if (!title || !title.trim()) return "";
@@ -253,17 +583,23 @@ interface TabInfo {
   discarded?: boolean;
   summaryFilename?: string;
   summaryContent?: string;
+  summaryVaultDir?: string;
   rawFilename?: string;
   rawContent?: string;
+  chatRawFilename?: string;
+  chatRawContent?: string;
   /** 1-0 本文取得で設定。要約 md の raw_content に書くパス */
   rawContentPathForSummary?: string;
   /** 本文中に言及された URL（要点リスト末尾に追記用） */
   extractedUrls?: string[];
   uid8?: string;
   baseForFilename?: string;
+  chatService?: ChatService;
+  pageImageUrls?: { src: string; alt: string; videoUrl?: string }[];
+  capturedImages?: { filename: string; alt: string; videoUrl?: string }[];
 }
 
-let allWindows: { id: number; tabs: TabInfo[]; label: string; labelFromSelection?: boolean }[] = [];
+let allWindows: { id: number; tabs: TabInfo[]; label: string; labelFromSelection?: boolean; captureImages?: boolean }[] = [];
 const selectedTabs = new Set<number>();
 
 const saveBtn = document.getElementById("saveBtn") as HTMLButtonElement;
@@ -303,6 +639,7 @@ async function buildWindowData(
       url: tab.url || "",
       content,
       discarded: tab.discarded,
+      chatService: detectChatService(tab.url || "") ?? undefined,
     });
   }
   const activeTab = tabs.find((t) => (t as chrome.tabs.Tab).active) ?? tabs[0];
@@ -379,9 +716,25 @@ function renderTabList() {
     const tabCountSpan = document.createElement("span");
     tabCountSpan.className = "window-tab-count";
     tabCountSpan.textContent = ` (${win.tabs.length}タブ)`;
+    const imgToggle = document.createElement("label");
+    imgToggle.className = "img-capture-toggle";
+    imgToggle.addEventListener("click", (e) => e.stopPropagation());
+    const imgCheckbox = document.createElement("input");
+    imgCheckbox.type = "checkbox";
+    imgCheckbox.checked = win.captureImages ?? false;
+    imgCheckbox.addEventListener("change", (e) => {
+      allWindows[winIndex].captureImages = (e.target as HTMLInputElement).checked;
+      imgToggle.classList.toggle("active", (e.target as HTMLInputElement).checked);
+    });
+    const imgLabelText = document.createElement("span");
+    imgLabelText.textContent = "画像";
+    imgToggle.appendChild(imgCheckbox);
+    imgToggle.appendChild(imgLabelText);
+
     windowHeader.appendChild(windowCheckbox);
     windowHeader.appendChild(labelSpan);
     windowHeader.appendChild(tabCountSpan);
+    windowHeader.appendChild(imgToggle);
     windowGroup.appendChild(windowHeader);
 
     win.tabs.forEach((tab) => {
@@ -555,6 +908,7 @@ function addPlaceholderFilenames(
       if (!tab.baseForFilename) tab.baseForFilename = base;
       tab.summaryFilename = `p-${base}_${uid}.md`;
       tab.summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary, w.windowLabel);
+      tab.summaryVaultDir = tab.chatService ? VAULT_REFERENCE_DIR : VAULT_CLIP_DIR;
     });
   });
 }
@@ -580,6 +934,142 @@ function buildRawContentMd(
     "",
   ].join("\n");
   return front + (bodyText || "");
+}
+
+function formatChatTurns(turns: { role: string; text: string }[]): string {
+  if (turns.length === 0) return "";
+  return turns.map((t) => `### ${t.role}\n${t.text}`).join("\n\n");
+}
+
+function buildChatDistillSource(turns: { role: string; text: string }[], rawText: string): string {
+  if (turns.length === 0) return sanitizeChatText(rawText);
+  const full = turns.map((t) => `${t.role}:\n${cleanChatTurnText(t.text)}`).join("\n\n");
+  const tailCount = Math.min(10, turns.length);
+  const tail = turns
+    .slice(-tailCount)
+    .map((t) => `${t.role}:\n${cleanChatTurnText(t.text)}`)
+    .join("\n\n");
+  // 後半を明示して重み付け（全体要約 + 直近論点を両立）
+  return [
+    "【要約方針】会話全体を要約しつつ、後半（最新側）の論点・結論を重視すること。",
+    "",
+    "【全体会話】",
+    full,
+    "",
+    "【後半重点（最新）】",
+    tail,
+  ].join("\n");
+}
+
+type ChatDistillJson = {
+  short_title: string;
+  points: string[];
+  summary: string;
+  lessons: string[];
+  longSummary: string;
+  topic_solutions: string[];
+  tags: string;
+};
+
+function parseChatDistillJson(raw: string): ChatDistillJson {
+  const t = (raw || "").trim();
+  const codeBlock = t.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+  const jsonText = (codeBlock ? codeBlock[1] : t).trim();
+  const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+  return {
+    short_title: String(parsed.short_title || ""),
+    points: Array.isArray(parsed.points) ? parsed.points.map(String).filter(Boolean) : [],
+    summary: String(parsed.summary || ""),
+    lessons: Array.isArray(parsed.lessons) ? parsed.lessons.map(String).filter(Boolean) : [],
+    longSummary: String(parsed.longSummary || ""),
+    topic_solutions: Array.isArray(parsed.topic_solutions)
+      ? parsed.topic_solutions.map(String).filter(Boolean)
+      : [],
+    tags: String(parsed.tags || ""),
+  };
+}
+
+function buildChatDistillPrompt(): string {
+  return `あなたは会話ログ要約の実行器です。入力された会話を読み、JSONのみを返してください。
+
+## 出力形式（JSONのみ）
+\`\`\`json
+{
+  "short_title": "ファイル名用の短いタイトル（20文字以内・日本語）",
+  "points": ["要点1", "要点2", "..."],
+  "summary": "要約（3〜6文）",
+  "lessons": ["教訓1", "教訓2", "..."],
+  "longSummary": "詳細要約（十分なボリューム。重要論点を広くカバー）",
+  "topic_solutions": ["話題A → 解決法A", "話題B → 解決法B", "..."],
+  "tags": "タグ1, タグ2, タグ3"
+}
+\`\`\`
+
+## ルール
+- 会話全体を対象にしつつ、後半（最新側）の論点・結論を重視する
+- 捏造禁止。本文にないことは書かない
+- すべて日本語で出力
+- points は **ちょうど3項目**（不足時も3項目に要約して出す）
+- lessons は 3〜8 項目
+- topic_solutions は必要なだけ列挙する（上限なし）。「話題 → 解決法」の構造で書く
+- 長文でも論点を落とさず、抽象化しすぎない
+- 余計な説明文は付けず JSON のみ返す`;
+}
+
+function buildChatRawContentMd(
+  rawText: string,
+  url: string,
+  service: string,
+  createdAt: string
+): string {
+  const normalized = normalizeUrlForDedup(url);
+  const body = sanitizeChatText(rawText);
+  const chars = body.length;
+  const front = [
+    "---",
+    "kind: raw_chat",
+    `created_at: ${createdAt}`,
+    `updated_at: ${createdAt}`,
+    "source: tabReaper",
+    `service: ${service}`,
+    `url: "${url.replace(/"/g, '\\"')}"`,
+    `normalized_url: "${normalized.replace(/"/g, '\\"')}"`,
+    `chars: ${chars}`,
+    "---",
+    "",
+  ].join("\n");
+  return front + body;
+}
+
+function buildChatReferenceFrontmatter(opts: {
+  url: string;
+  rawContentPath: string;
+  rawChatPath: string;
+  windowLabel: string;
+  hasRaw: boolean;
+  service: string;
+  extraction: { domTurns: number; turns: number; rawChars: number; partial: boolean; warnings: string[] };
+}): string {
+  const rawPolicy = opts.hasRaw ? "stored" : "url_only";
+  return [
+    "---",
+    "source_type: chat",
+    "pipeline: distill",
+    `raw_policy: ${rawPolicy}`,
+    `date: ${todayDate()}`,
+    `service: ${opts.service}`,
+    `window: ${opts.windowLabel}`,
+    `url: ${opts.url}`,
+    `raw_content: ${opts.rawContentPath}`,
+    `raw_chat: ${opts.rawChatPath}`,
+    "linked_from: tabReaper",
+    `extraction_dom_turns: ${opts.extraction.domTurns}`,
+    `extraction_turns: ${opts.extraction.turns}`,
+    `extraction_raw_chars: ${opts.extraction.rawChars}`,
+    `extraction_partial: ${opts.extraction.partial}`,
+    `extraction_warnings: ${JSON.stringify(opts.extraction.warnings)}`,
+    "---",
+  ].join("\n");
 }
 
 /** Twitter/X のときはタブでスレッド（本ツイート＋本人続き）を取得。失敗時は null */
@@ -648,24 +1138,139 @@ async function runUrlSummaryForTab(
   }
 }
 
+async function runChatDistillForTab(
+  tab: TabInfo,
+  apiKey: string,
+  provider: AIProvider,
+  modelId: string,
+  windowLabel: string,
+  chatContent: { turns: { role: string; text: string }[]; rawText: string; extractionMeta: { domTurns: number } },
+  rawChatPath: string
+): Promise<{ summaryFilename: string; summaryContent: string }> {
+  const uid = tab.uid8 ?? uid8();
+  const turns = dedupeTurns(chatContent.turns);
+  const conversationMd = turns.length > 0 ? formatChatTurns(turns) : sanitizeChatText(chatContent.rawText).slice(0, 50000);
+  const distillSource = buildChatDistillSource(turns, chatContent.rawText);
+  const turnsCount = turns.length;
+  const rawChars = (chatContent.rawText || "").length;
+  const userCount = turns.filter((t) => t.role === "User").length;
+  const asstCount = turns.filter((t) => t.role === "Assistant").length;
+  const warnings: string[] = [];
+  if (turnsCount < 4) warnings.push("low_turn_count");
+  if (rawChars < 80) warnings.push("short_raw_text");
+  if (Math.max(userCount, asstCount) >= 3 * Math.max(Math.min(userCount, asstCount), 1)) warnings.push("biased_roles");
+  const extraction = {
+    domTurns: chatContent.extractionMeta.domTurns,
+    turns: turnsCount,
+    rawChars,
+    partial: warnings.length > 0,
+    warnings,
+  };
+  const rawPath = tab.rawContentPathForSummary ?? "（未設定）";
+  const hasRaw = rawPath !== "（未設定）";
+  const fm = buildChatReferenceFrontmatter({
+    url: tab.url,
+    rawContentPath: rawPath,
+    rawChatPath,
+    windowLabel,
+    hasRaw,
+    service: tab.chatService ?? "unknown",
+    extraction,
+  });
+
+  try {
+    const prompt = `${buildChatDistillPrompt()}\n\n## 会話ログ\n${distillSource.slice(0, 30000)}`;
+    const ai = await callAI(provider, [{ role: "user", content: prompt }], {
+      apiKey,
+      model: modelId,
+      timeout: 90000,
+      maxTokens: 3500,
+      temperature: 0.25,
+    });
+    const json = parseChatDistillJson(ai.text || "");
+    const base =
+      getShortTitleForFilename(json.short_title) || generateShortTitle({ rawTitle: tab.title || "", url: tab.url });
+    const summaryFilename = `p-${base}_${uid}.md`;
+    const pointsMd = json.points.length > 0 ? json.points.map((p) => `- ${p}`).join("\n") : "- （distill未取得）";
+    const lessonsMd =
+      json.lessons.length > 0 ? json.lessons.map((p) => `- ${p}`).join("\n") : "- （distill未取得）";
+    const topicSolutionsMd =
+      json.topic_solutions.length > 0
+        ? json.topic_solutions.map((p) => `- ${p}`).join("\n")
+        : "- （distill未取得）";
+    const tagsMd = (json.tags || "")
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .map((t) => `[[${t}]]`)
+      .join(" ");
+    const summaryContent = `${fm}
+
+## 要点
+${pointsMd}
+
+## 要約
+${json.summary || "（distill未取得）"}
+
+## 教訓・示唆
+${lessonsMd}
+
+## 詳細要約
+${json.longSummary || "（distill未取得）"}
+
+## 話題と解決法
+${topicSolutionsMd}
+
+### tags
+${tagsMd || "（未設定）"}
+
+---
+url: ${tab.url}
+raw_content: ${rawPath}
+created_at: ${new Date().toISOString()}
+raw_pagetitle: ${(tab.title || "").trim() || "（無題）"}
+linked_from: tabReaper
+---
+
+## 会話
+${conversationMd}
+`;
+    return { summaryFilename, summaryContent };
+  } catch {
+    const summaryFilename = `p-chat_${uid}.md`;
+    const summaryContent = `${fm}
+
+## 要点
+- （distill未取得）
+
+## 会話
+${conversationMd}
+`;
+    return { summaryFilename, summaryContent };
+  }
+}
+
 function getSelectedTabsByWindow(): {
   windowIndex: number;
   windowLabel: string;
   tabs: TabInfo[];
+  captureImages: boolean;
 }[] {
-  const byWindow: { windowIndex: number; windowLabel: string; tabs: TabInfo[] }[] = [];
+  const byWindow: { windowIndex: number; windowLabel: string; tabs: TabInfo[]; captureImages: boolean }[] = [];
   allWindows.forEach((win, winIndex) => {
     const tabs = win.tabs.filter((t) => selectedTabs.has(t.id));
     if (tabs.length === 0) return;
     byWindow.push({
       windowIndex: winIndex + 1,
       windowLabel: win.label,
+      captureImages: win.captureImages ?? false,
       tabs: tabs.map((t) => ({
         id: t.id,
         title: t.title,
         url: t.url,
         content: t.content,
         discarded: t.discarded,
+        chatService: t.chatService,
       })),
     });
   });
@@ -747,11 +1352,19 @@ async function refineAllWindowsLabelsOnFetch(): Promise<void> {
 async function saveTabSummariesToVault(
   cfg: ObsidianRestConfig,
   byWindow: { windowIndex: number; windowLabel: string; tabs: TabInfo[] }[]
-) {
+): Promise<Set<number>> {
+  const failedSummaryTabIds = new Set<number>();
   const flat = byWindow.flatMap((w) => w.tabs).filter((t) => t.summaryFilename && t.summaryContent);
   for (const tab of flat) {
-    await putVaultFile(cfg, `${VAULT_CLIP_DIR}/${tab.summaryFilename!}`, tab.summaryContent!);
+    const dir = tab.summaryVaultDir ?? (tab.chatService ? VAULT_REFERENCE_DIR : VAULT_CLIP_DIR);
+    try {
+      await putVaultFile(cfg, `${dir}/${tab.summaryFilename!}`, tab.summaryContent!);
+    } catch (e) {
+      failedSummaryTabIds.add(tab.id);
+      console.error("summary save error:", tab.url, e);
+    }
   }
+  return failedSummaryTabIds;
 }
 
 async function saveRawToVault(
@@ -762,13 +1375,18 @@ async function saveRawToVault(
   for (const tab of flat) {
     await putVaultFile(cfg, `${VAULT_RAW_DIR}/${tab.rawFilename!}`, tab.rawContent!, "text/markdown");
   }
+  const chatRawTabs = byWindow.flatMap((w) => w.tabs).filter((t) => t.chatRawFilename && t.chatRawContent);
+  for (const tab of chatRawTabs) {
+    await putVaultFile(cfg, `${VAULT_RAW_DIR}/${tab.chatRawFilename!}`, tab.chatRawContent!, "text/markdown");
+  }
 }
 
 const DAY_INDEX_PATH = "library/day-index.md";
 
 function buildDayIndexEntry(
   byWindow: { windowIndex: number; windowLabel: string; tabs: TabInfo[] }[],
-  date: Date
+  date: Date,
+  failedSummaryTabIds: Set<number> = new Set<number>()
 ): string {
   const ymd =
     date.getFullYear() +
@@ -780,7 +1398,8 @@ function buildDayIndexEntry(
   byWindow.forEach((w) => {
     lines.push(`- ${w.windowLabel}`);
     w.tabs.forEach((t) => {
-      const link = t.summaryFilename
+      const useUrl = failedSummaryTabIds.has(t.id);
+      const link = !useUrl && t.summaryFilename
         ? `[[${t.summaryFilename.replace(/\.md$/i, "")}]]`
         : `[${t.title || "（無題）"}](${t.url})`;
       lines.push(`\t- ${link}`);
@@ -792,9 +1411,10 @@ function buildDayIndexEntry(
 async function appendDayIndex(
   cfg: ObsidianRestConfig,
   byWindow: { windowIndex: number; windowLabel: string; tabs: TabInfo[] }[],
-  date: Date
+  date: Date,
+  failedSummaryTabIds: Set<number> = new Set<number>()
 ) {
-  const entry = buildDayIndexEntry(byWindow, date);
+  const entry = buildDayIndexEntry(byWindow, date, failedSummaryTabIds);
   await appendVaultFile(cfg, DAY_INDEX_PATH, "\n" + entry);
 }
 
@@ -868,6 +1488,12 @@ async function saveSelectedTabs() {
     } else {
       tab.rawContentPathForSummary = "（未設定）";
     }
+
+    const winForTab = byWindow.find((w) => w.tabs.some((t) => t.id === tab.id));
+    if (winForTab?.captureImages) {
+      showStatus(`画像URL取得中 (${i + 1}/${total})...`, "info");
+      tab.pageImageUrls = await fetchTabImages(tab.id, tab.url, false);
+    }
   }
 
   const tabWindowLabel = new Map<number, string>();
@@ -877,6 +1503,29 @@ async function saveSelectedTabs() {
     for (let i = 0; i < flatTabs.length; i++) {
       const tab = flatTabs[i];
       const wLabel = tabWindowLabel.get(tab.id) ?? "";
+      if (tab.chatService) {
+        showStatus(`チャット抽出中 (${i + 1}/${total})...`, "info");
+        const chat = await fetchChatContent(tab.id, tab.url, false);
+        const uid = tab.uid8 ?? uid8();
+        const createdAt = new Date().toISOString();
+        tab.chatRawFilename = `chat-${tab.chatService}_${uid}.md`;
+        tab.chatRawContent = buildChatRawContentMd(chat.rawText, tab.url, tab.chatService, createdAt);
+        const rawChatPath = `${RAW_CONTENT_PATH_PREFIX}/${tab.chatRawFilename}`;
+        showStatus(`distill中 (${i + 1}/${total})...`, "info");
+        const out = await runChatDistillForTab(
+          tab,
+          apiKey,
+          workerModel.provider,
+          workerModel.modelId,
+          wLabel,
+          chat,
+          rawChatPath
+        );
+        tab.summaryFilename = out.summaryFilename;
+        tab.summaryContent = out.summaryContent;
+        tab.summaryVaultDir = VAULT_REFERENCE_DIR;
+        continue;
+      }
       const maxAttempts = 3;
       let succeeded = false;
       for (let attempt = 0; attempt < maxAttempts && !succeeded; attempt++) {
@@ -894,12 +1543,14 @@ async function saveSelectedTabs() {
           );
           tab.summaryFilename = out.summaryFilename;
           tab.summaryContent = out.summaryContent;
+          tab.summaryVaultDir = VAULT_CLIP_DIR;
           succeeded = true;
         } catch (err) {
           console.error(`URL要約エラー (attempt ${attempt + 1}/${maxAttempts}):`, tab.url, err);
           if (attempt === maxAttempts - 1) {
             tab.summaryFilename = `p-untitled_${tab.uid8 ?? uid8()}.md`;
             tab.summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary, wLabel);
+            tab.summaryVaultDir = VAULT_CLIP_DIR;
           }
         }
       }
@@ -908,12 +1559,41 @@ async function saveSelectedTabs() {
     addPlaceholderFilenames(byWindow);
   }
 
+  for (let i = 0; i < flatTabs.length; i++) {
+    const tab = flatTabs[i];
+    if (!tab.pageImageUrls?.length) continue;
+    showStatus(`画像ダウンロード中 (${i + 1}/${total})...`, "info");
+    const tabUid = tab.uid8 ?? uid8();
+    const images: { filename: string; alt: string; videoUrl?: string }[] = [];
+    for (let j = 0; j < tab.pageImageUrls.length; j++) {
+      const img = tab.pageImageUrls[j];
+      const downloaded = await downloadImage(img.src);
+      if (!downloaded) continue;
+      const filename = `img-${tabUid}_${j}.${downloaded.ext}`;
+      try {
+        await putVaultBinary(
+          restCfg,
+          `${VAULT_IMAGE_DIR}/${filename}`,
+          downloaded.data,
+          downloaded.contentType,
+        );
+        images.push({ filename, alt: img.alt, videoUrl: img.videoUrl });
+      } catch (e) {
+        console.error("image save error:", img.src, e);
+      }
+    }
+    tab.capturedImages = images;
+    if (images.length > 0 && tab.summaryContent) {
+      tab.summaryContent = appendImagesSectionToMd(tab.summaryContent, images);
+    }
+  }
+
   showStatus("Obsidian に保存中...", "info");
   try {
     await saveRawToVault(restCfg, byWindow);
-    await saveTabSummariesToVault(restCfg, byWindow);
-    await appendDayIndex(restCfg, byWindow, new Date());
-    showStatus("library/clip/ に保存しました", "success");
+    const failedSummaryTabIds = await saveTabSummariesToVault(restCfg, byWindow);
+    await appendDayIndex(restCfg, byWindow, new Date(), failedSummaryTabIds);
+    showStatus("library/clip・library/reference に保存しました", "success");
     window.close();
   } catch (e) {
     showStatus(`保存エラー: ${(e as Error).message}`, "error");

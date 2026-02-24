@@ -57,6 +57,27 @@ export async function putVaultFile(
   }
 }
 
+/** PUT /vault/{path} — create or overwrite a binary file (images, etc.) */
+export async function putVaultBinary(
+  cfg: ObsidianRestConfig,
+  vaultPath: string,
+  data: ArrayBuffer,
+  contentType: string,
+): Promise<void> {
+  const res = await fetch(`${cfg.baseUrl}/vault/${encodeVaultPath(vaultPath)}`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      "Content-Type": contentType,
+    },
+    body: data,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`PUT /vault/${vaultPath} failed: ${res.status} ${body}`);
+  }
+}
+
 /** POST /vault/{path} — append content to a file (creates if not exists) */
 export async function appendVaultFile(
   cfg: ObsidianRestConfig,
