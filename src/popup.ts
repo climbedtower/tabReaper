@@ -1594,7 +1594,7 @@ async function saveSelectedTabs() {
     const failedSummaryTabIds = await saveTabSummariesToVault(restCfg, byWindow);
     await appendDayIndex(restCfg, byWindow, new Date(), failedSummaryTabIds);
     showStatus("library/clip・library/reference に保存しました", "success");
-    window.close();
+    // 取り込み終了状態でポップアップは開いたままにする（自動で閉じない）
   } catch (e) {
     showStatus(`保存エラー: ${(e as Error).message}`, "error");
     console.error(e);
