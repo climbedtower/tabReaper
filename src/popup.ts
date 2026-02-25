@@ -19,6 +19,7 @@ import {
 } from "ai-roles";
 import { callAI } from "call-ai";
 import { logger } from "@pipelines/distill-logger";
+import { normalize, type ChatMessage } from "@pipelines/normalizer";
 import { process as runTaskReaperProcess } from "@pipelines/task-reaper";
 import {
   loadRestConfig,
@@ -472,66 +473,13 @@ async function fetchTabBodyAndLinks(
   }
 }
 
-function sanitizeChatText(raw: string): string {
-  return (raw || "").replace(/\r\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-function cleanChatTurnText(raw: string): string {
-  const lines = (raw || "").split("\n");
-  const cleaned = lines
-    .map((l) => l.trimEnd())
-    .filter((l) => !/^(思考プロセスを表示|Gemini の回答|あなたのプロンプト|Gemini との会話|Gemini|Pro)\s*$/i.test(l.trim()));
-  return cleaned.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-function extractTurnsFromRawText(raw: string): { role: string; text: string }[] {
-  const lines = sanitizeChatText(raw).split("\n");
-  const out: { role: string; text: string }[] = [];
-  let role: "User" | "Assistant" | null = null;
-  let buf: string[] = [];
-  const flush = () => {
-    const text = cleanChatTurnText(buf.join("\n"));
-    if (role && text) out.push({ role, text });
-    buf = [];
-  };
-  for (const line of lines) {
-    if (/^(あなたのプロンプト|You|User)\s*$/i.test(line.trim())) {
-      flush();
-      role = "User";
-      continue;
-    }
-    if (/^(Gemini の回答|Assistant|Claude|ChatGPT)\s*$/i.test(line.trim())) {
-      flush();
-      role = "Assistant";
-      continue;
-    }
-    if (role) buf.push(line);
-  }
-  flush();
-  return out;
-}
-
-function dedupeTurns(turns: { role: string; text: string }[]): { role: string; text: string }[] {
-  const seen = new Set<string>();
-  const out: { role: string; text: string }[] = [];
-  for (const t of turns) {
-    const text = (t.text || "").trim();
-    if (!text) continue;
-    const key = `${t.role}:${text.replace(/\s+/g, " ").trim()}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ role: t.role, text });
-  }
-  return out;
-}
-
 async function fetchChatContent(
   tabId: number,
   url: string,
   discarded: boolean
-): Promise<{ service: string; turns: { role: string; text: string }[]; rawText: string; extractionMeta: { domTurns: number } }> {
+): Promise<{ service: string; messages: ChatMessage[]; raw_text: string; extractionMeta: { domTurns: number } }> {
   if (isTabUninjectable(url, discarded)) {
-    return { service: "unknown", turns: [], rawText: "", extractionMeta: { domTurns: 0 } };
+    return { service: "unknown", messages: [], raw_text: "", extractionMeta: { domTurns: 0 } };
   }
   try {
     const extraction = chrome.scripting.executeScript({
@@ -543,16 +491,19 @@ async function fetchChatContent(
     );
     const result = (await Promise.race([extraction, timed])) as chrome.scripting.InjectionResult[];
     const data = result?.[0]?.result as { service?: string; rawText?: string } | undefined;
-    const rawText = sanitizeChatText(data?.rawText ?? "");
-    const turns = dedupeTurns(extractTurnsFromRawText(rawText));
+    const normalized = normalize({
+      mode: "chat",
+      rawText: data?.rawText ?? "",
+      metadata: { service: data?.service ?? "unknown" },
+    });
     return {
-      service: data?.service ?? "unknown",
-      turns,
-      rawText,
+      service: (normalized.metadata.service as string) ?? "unknown",
+      messages: normalized.messages,
+      raw_text: normalized.raw_text,
       extractionMeta: { domTurns: 0 },
     };
   } catch {
-    return { service: "unknown", turns: [], rawText: "", extractionMeta: { domTurns: 0 } };
+    return { service: "unknown", messages: [], raw_text: "", extractionMeta: { domTurns: 0 } };
   }
 }
 
@@ -944,18 +895,18 @@ function buildRawContentMd(
   return front + (bodyText || "");
 }
 
-function formatChatTurns(turns: { role: string; text: string }[]): string {
-  if (turns.length === 0) return "";
-  return turns.map((t) => `### ${t.role}\n${t.text}`).join("\n\n");
+function formatChatTurns(messages: ChatMessage[]): string {
+  if (messages.length === 0) return "";
+  return messages.map((m) => `### ${m.speaker}\n${m.text}`).join("\n\n");
 }
 
-function buildChatDistillSource(turns: { role: string; text: string }[], rawText: string): string {
-  if (turns.length === 0) return sanitizeChatText(rawText);
-  const full = turns.map((t) => `${t.role}:\n${cleanChatTurnText(t.text)}`).join("\n\n");
-  const tailCount = Math.min(10, turns.length);
-  const tail = turns
+function buildChatDistillSource(messages: ChatMessage[], rawText: string): string {
+  if (messages.length === 0) return rawText;
+  const full = messages.map((m) => `${m.speaker}:\n${m.text}`).join("\n\n");
+  const tailCount = Math.min(10, messages.length);
+  const tail = messages
     .slice(-tailCount)
-    .map((t) => `${t.role}:\n${cleanChatTurnText(t.text)}`)
+    .map((m) => `${m.speaker}:\n${m.text}`)
     .join("\n\n");
   return [
     "【要約方針】会話全体を要約しつつ、後半（最新側）の論点・結論を重視すること。",
@@ -966,21 +917,6 @@ function buildChatDistillSource(turns: { role: string; text: string }[], rawText
     "【後半重点（最新）】",
     tail,
   ].join("\n");
-}
-
-function toTaskReaperTurns(
-  turns: { role: string; text: string }[]
-): { turn: number; role: "user" | "assistant"; text: string }[] {
-  return turns
-    .map((t, idx) => {
-      const role: "user" | "assistant" = t.role === "User" ? "user" : "assistant";
-      return {
-        turn: idx + 1,
-        role,
-        text: cleanChatTurnText(t.text),
-      };
-    })
-    .filter((t) => t.text.length > 0);
 }
 
 function normalizeSentence(s: string): string {
@@ -1096,7 +1032,7 @@ function buildChatRawContentMd(
   createdAt: string
 ): string {
   const normalized = normalizeUrlForDedup(url);
-  const body = sanitizeChatText(rawText);
+  const body = rawText ?? "";
   const chars = body.length;
   const front = [
     "---",
@@ -1233,17 +1169,18 @@ async function runChatDistillForTab(
   provider: AIProvider,
   modelId: string,
   windowLabel: string,
-  chatContent: { turns: { role: string; text: string }[]; rawText: string; extractionMeta: { domTurns: number } },
+  chatContent: { messages: ChatMessage[]; raw_text: string; extractionMeta: { domTurns: number } },
   rawChatPath: string
 ): Promise<{ summaryFilename: string; summaryContent: string; outputDir: string }> {
   const uid = tab.uid8 ?? uid8();
-  const turns = dedupeTurns(chatContent.turns);
-  const conversationMd = turns.length > 0 ? formatChatTurns(turns) : sanitizeChatText(chatContent.rawText).slice(0, 50000);
-  const distillSource = buildChatDistillSource(turns, chatContent.rawText);
-  const turnsCount = turns.length;
-  const rawChars = (chatContent.rawText || "").length;
-  const userCount = turns.filter((t) => t.role === "User").length;
-  const asstCount = turns.filter((t) => t.role === "Assistant").length;
+  const messages = chatContent.messages;
+  const conversationMd =
+    messages.length > 0 ? formatChatTurns(messages) : chatContent.raw_text.slice(0, 50000);
+  const distillSource = buildChatDistillSource(messages, chatContent.raw_text);
+  const turnsCount = messages.length;
+  const rawChars = (chatContent.raw_text || "").length;
+  const userCount = messages.filter((m) => m.speaker === "user").length;
+  const asstCount = messages.filter((m) => m.speaker === "assistant").length;
   const warnings: string[] = [];
   if (turnsCount < 4) warnings.push("low_turn_count");
   if (rawChars < 80) warnings.push("short_raw_text");
@@ -1267,6 +1204,12 @@ async function runChatDistillForTab(
     extraction,
   });
 
+  const distillMessages = messages.map((m) => ({
+    turn: m.seq,
+    role: m.speaker,
+    text: m.text,
+  }));
+
   try {
     const taskReaperOut = await runTaskReaperProcess(
       {
@@ -1280,7 +1223,7 @@ async function runChatDistillForTab(
         },
         options: {
           pipelineMode: "distill",
-          distillMessages: toTaskReaperTurns(turns),
+          distillMessages,
         },
       },
       buildTaskReaperApiKeys(provider, apiKey)
@@ -1674,7 +1617,7 @@ async function saveSelectedTabs() {
         const uid = tab.uid8 ?? uid8();
         const createdAt = new Date().toISOString();
         tab.chatRawFilename = `chat-${tab.chatService}_${uid}.md`;
-        tab.chatRawContent = buildChatRawContentMd(chat.rawText, tab.url, tab.chatService, createdAt);
+        tab.chatRawContent = buildChatRawContentMd(chat.raw_text, tab.url, tab.chatService, createdAt);
         const rawChatPath = `${RAW_CONTENT_PATH_PREFIX}/${tab.chatRawFilename}`;
         showStatus(`distill中 (${i + 1}/${total})...`, "info");
         const out = await runChatDistillForTab(
