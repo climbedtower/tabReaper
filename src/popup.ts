@@ -957,7 +957,6 @@ function buildChatDistillSource(turns: { role: string; text: string }[], rawText
     .slice(-tailCount)
     .map((t) => `${t.role}:\n${cleanChatTurnText(t.text)}`)
     .join("\n\n");
-  // 後半を明示して重み付け（全体要約 + 直近論点を両立）
   return [
     "【要約方針】会話全体を要約しつつ、後半（最新側）の論点・結論を重視すること。",
     "",
@@ -982,26 +981,6 @@ function toTaskReaperTurns(
       };
     })
     .filter((t) => t.text.length > 0);
-}
-
-function stripLeadingFrontmatter(md: string): string {
-  const m = md.match(/^---\n[\s\S]*?\n---\n?/);
-  return m ? md.slice(m[0].length).trim() : md.trim();
-}
-
-function localizeDistillMarkdown(md: string): string {
-  return md
-    .replace(/^##\s+Logical\b/gm, "## 論理レイヤー")
-    .replace(/^##\s+Emotional\b/gm, "## 感情レイヤー")
-    .replace(/^###\s+actions\b/gm, "### アクション")
-    .replace(/^###\s+details\b/gm, "### 詳細")
-    .replace(/^###\s+emotion_arc\b/gm, "### 感情の推移")
-    .replace(/^###\s+core_conflicts\b/gm, "### 中心的な葛藤")
-    .replace(/^###\s+boundaries\b/gm, "### 境界条件")
-    .replace(/^###\s+landing\b/gm, "### 着地点")
-    .replace(/^###\s+attributions\b/gm, "### 帰属")
-    .replace(/^###\s+Authorship Ledger（要約）/gm, "### 帰属台帳（要約）")
-    .replace(/^###\s+warnings\b/gm, "### 注意点");
 }
 
 function normalizeSentence(s: string): string {
@@ -1302,9 +1281,6 @@ async function runChatDistillForTab(
       taskReaperOut.details && taskReaperOut.details.length > 0
         ? taskReaperOut.details.map((p) => `- ${p}`).join("\n")
         : "- （distill未取得）";
-    const combinedDistillMd = taskReaperOut.combined_markdown
-      ? localizeDistillMarkdown(stripLeadingFrontmatter(taskReaperOut.combined_markdown))
-      : "（distill未取得）";
     const layerMd = taskReaperOut.distill_mode
       ? `${taskReaperOut.distill_mode}${taskReaperOut.distill_reason ? ` (${taskReaperOut.distill_reason})` : ""}`
       : "（未判定）";
@@ -1332,7 +1308,7 @@ ${lessonsMd}
 ${layerMd}
 
 ## 蒸留結果
-${combinedDistillMd}
+（論理・感情レイヤーは logger 配線後に表示）
 
 ### tags
 ${tagsMd || "（未設定）"}
