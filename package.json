@@ -8,6 +8,7 @@
     "dev": "vite build --watch"
   },
   "dependencies": {
+    "@pipelines/task-reaper": "file:../pipelines/task-reaper",
     "@pipelines/url-summary": "file:../pipelines/url-summary",
     "ai-roles": "file:../pipelines/ai-roles",
     "call-ai": "file:../pipelines/call-ai"

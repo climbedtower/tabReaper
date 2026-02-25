@@ -19,6 +19,7 @@ import {
   type AIProvider,
 } from "ai-roles";
 import { callAI } from "call-ai";
+import { process as runTaskReaperProcess } from "@pipelines/task-reaper";
 import {
   loadRestConfig,
   healthCheck,
@@ -674,8 +675,13 @@ async function fetchCurrentWindowTabs() {
     const labelFromSelection = initialLabelFromSelection != null;
     const initialLabel = initialLabelFromSelection ?? data.suggestedLabel ?? "ウィンドウ 1";
     allWindows = [{ id: data.id, tabs: data.tabs, label: initialLabel, labelFromSelection }];
+    // 画像以外はすべてチェック済みで表示（画像は未チェックのまま）
+    for (const w of allWindows) {
+      for (const t of w.tabs) selectedTabs.add(t.id);
+    }
     await refineAllWindowsLabelsOnFetch();
     renderTabList();
+    updateCopyButton();
     showStatus(`現在のウィンドウ（${allWindows[0].tabs.length}タブ）`, "success");
   } catch (error) {
     showStatus(`エラー: ${(error as Error).message}`, "error");
@@ -743,6 +749,7 @@ function renderTabList() {
       const tabCheckbox = document.createElement("input");
       tabCheckbox.type = "checkbox";
       tabCheckbox.id = `tab-${tab.id}`;
+      tabCheckbox.checked = selectedTabs.has(tab.id);
       tabCheckbox.addEventListener("change", (e) => {
         toggleTab(tab.id, (e.target as HTMLInputElement).checked);
       });
@@ -906,7 +913,8 @@ function addPlaceholderFilenames(
       const base = tab.baseForFilename ?? getBaseForTab(tab);
       if (!tab.uid8) tab.uid8 = uid;
       if (!tab.baseForFilename) tab.baseForFilename = base;
-      tab.summaryFilename = `p-${base}_${uid}.md`;
+      const prefix = tab.chatService ? "c-" : detectSourceType(tab.url ?? "") === "x" ? "p-x-" : "p-";
+      tab.summaryFilename = `${prefix}${base}_${uid}.md`;
       tab.summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary, w.windowLabel);
       tab.summaryVaultDir = tab.chatService ? VAULT_REFERENCE_DIR : VAULT_CLIP_DIR;
     });
@@ -959,6 +967,92 @@ function buildChatDistillSource(turns: { role: string; text: string }[], rawText
     "【後半重点（最新）】",
     tail,
   ].join("\n");
+}
+
+function toTaskReaperTurns(
+  turns: { role: string; text: string }[]
+): { turn: number; role: "user" | "assistant"; text: string }[] {
+  return turns
+    .map((t, idx) => {
+      const role: "user" | "assistant" = t.role === "User" ? "user" : "assistant";
+      return {
+        turn: idx + 1,
+        role,
+        text: cleanChatTurnText(t.text),
+      };
+    })
+    .filter((t) => t.text.length > 0);
+}
+
+function stripLeadingFrontmatter(md: string): string {
+  const m = md.match(/^---\n[\s\S]*?\n---\n?/);
+  return m ? md.slice(m[0].length).trim() : md.trim();
+}
+
+function localizeDistillMarkdown(md: string): string {
+  return md
+    .replace(/^##\s+Logical\b/gm, "## 論理レイヤー")
+    .replace(/^##\s+Emotional\b/gm, "## 感情レイヤー")
+    .replace(/^###\s+actions\b/gm, "### アクション")
+    .replace(/^###\s+details\b/gm, "### 詳細")
+    .replace(/^###\s+emotion_arc\b/gm, "### 感情の推移")
+    .replace(/^###\s+core_conflicts\b/gm, "### 中心的な葛藤")
+    .replace(/^###\s+boundaries\b/gm, "### 境界条件")
+    .replace(/^###\s+landing\b/gm, "### 着地点")
+    .replace(/^###\s+attributions\b/gm, "### 帰属")
+    .replace(/^###\s+Authorship Ledger（要約）/gm, "### 帰属台帳（要約）")
+    .replace(/^###\s+warnings\b/gm, "### 注意点");
+}
+
+function normalizeSentence(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+function splitJapaneseSentences(text: string): string[] {
+  const normalized = normalizeSentence(text);
+  if (!normalized) return [];
+  const parts = normalized
+    .split(/(?<=[。！？!?])/)
+    .map((p) => normalizeSentence(p))
+    .filter(Boolean);
+  return parts.length > 0 ? parts : [normalized];
+}
+
+function pickGlobalThreePoints(summary: string, details: string[]): string[] {
+  const sentences = splitJapaneseSentences(summary);
+  if (sentences.length >= 3) {
+    const mid = Math.floor((sentences.length - 1) / 2);
+    return [sentences[0], sentences[mid], sentences[sentences.length - 1]].map(normalizeSentence);
+  }
+  if (sentences.length === 2) {
+    const fallback = details.find((d) => normalizeSentence(d).length > 0) ?? "";
+    return [sentences[0], sentences[1], fallback || sentences[1]].map(normalizeSentence);
+  }
+  if (sentences.length === 1) {
+    const clauses = sentences[0]
+      .split(/、|，|;|；/g)
+      .map((c) => normalizeSentence(c))
+      .filter(Boolean);
+    if (clauses.length >= 3) {
+      const mid = Math.floor((clauses.length - 1) / 2);
+      return [clauses[0], clauses[mid], clauses[clauses.length - 1]];
+    }
+    const topDetails = details
+      .map((d) => normalizeSentence(d))
+      .filter(Boolean)
+      .slice(0, 2);
+    return [sentences[0], ...topDetails].slice(0, 3);
+  }
+  const ds = details.map((d) => normalizeSentence(d)).filter(Boolean).slice(0, 3);
+  return ds.length > 0 ? ds : ["（distill未取得）"];
+}
+
+function buildTaskReaperApiKeys(provider: AIProvider, apiKey: string): APIKeySettings {
+  const keys: APIKeySettings = {};
+  if (provider === "gemini") keys.geminiApiKey = apiKey;
+  if (provider === "openai") keys.openaiApiKey = apiKey;
+  if (provider === "claude") keys.claudeApiKey = apiKey;
+  return keys;
 }
 
 type ChatDistillJson = {
@@ -1129,10 +1223,12 @@ async function runUrlSummaryForTab(
     let summaryContent = `${fm}\n\n${summaryBody}`;
     summaryContent = appendUrlsToPointsSection(summaryContent, tab.extractedUrls ?? []);
     const base = getShortTitleForFilename(json.short_title) || generateShortTitle({ rawTitle: tab.title || "", url: tab.url });
-    const summaryFilename = `p-${base}_${uid}.md`;
+    const clipPrefix = detectSourceType(tab.url ?? "") === "x" ? "p-x-" : "p-";
+    const summaryFilename = `${clipPrefix}${base}_${uid}.md`;
     return { summaryFilename, summaryContent };
   } catch {
-    const summaryFilename = `p-untitled_${uid}.md`;
+    const clipPrefix = detectSourceType(tab.url ?? "") === "x" ? "p-x-" : "p-";
+    const summaryFilename = `${clipPrefix}untitled_${uid}.md`;
     const summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary, windowLabel);
     return { summaryFilename, summaryContent };
   }
@@ -1179,32 +1275,109 @@ async function runChatDistillForTab(
   });
 
   try {
-    const prompt = `${buildChatDistillPrompt()}\n\n## 会話ログ\n${distillSource.slice(0, 30000)}`;
-    const ai = await callAI(provider, [{ role: "user", content: prompt }], {
-      apiKey,
-      model: modelId,
-      timeout: 90000,
-      maxTokens: 3500,
-      temperature: 0.25,
-    });
-    const json = parseChatDistillJson(ai.text || "");
-    const base =
-      getShortTitleForFilename(json.short_title) || generateShortTitle({ rawTitle: tab.title || "", url: tab.url });
-    const summaryFilename = `p-${base}_${uid}.md`;
-    const pointsMd = json.points.length > 0 ? json.points.map((p) => `- ${p}`).join("\n") : "- （distill未取得）";
+    const taskReaperOut = await runTaskReaperProcess(
+      {
+        text: distillSource.slice(0, 30000),
+        mode: "task",
+        metadata: {
+          source_type: "chat",
+          title: tab.title || "",
+          url: tab.url,
+          service: tab.chatService ?? "unknown",
+        },
+        options: {
+          pipelineMode: "distill",
+          distillMessages: toTaskReaperTurns(turns),
+        },
+      },
+      buildTaskReaperApiKeys(provider, apiKey)
+    );
+
+    const titleSeed = (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
+    const base = getShortTitleForFilename(titleSeed) || generateShortTitle({ rawTitle: titleSeed, url: tab.url });
+    const summaryFilename = `c-${base}_${uid}.md`;
+    const points = pickGlobalThreePoints(taskReaperOut.summary || "", taskReaperOut.details || []);
+    const pointsMd = points.length > 0 ? points.slice(0, 3).map((p) => `- ${p}`).join("\n") : "- （distill未取得）";
     const lessonsMd =
-      json.lessons.length > 0 ? json.lessons.map((p) => `- ${p}`).join("\n") : "- （distill未取得）";
-    const topicSolutionsMd =
-      json.topic_solutions.length > 0
-        ? json.topic_solutions.map((p) => `- ${p}`).join("\n")
+      taskReaperOut.details && taskReaperOut.details.length > 0
+        ? taskReaperOut.details.map((p) => `- ${p}`).join("\n")
         : "- （distill未取得）";
-    const tagsMd = (json.tags || "")
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean)
+    const combinedDistillMd = taskReaperOut.combined_markdown
+      ? localizeDistillMarkdown(stripLeadingFrontmatter(taskReaperOut.combined_markdown))
+      : "（distill未取得）";
+    const layerMd = taskReaperOut.distill_mode
+      ? `${taskReaperOut.distill_mode}${taskReaperOut.distill_reason ? ` (${taskReaperOut.distill_reason})` : ""}`
+      : "（未判定）";
+    const tagsMd = [
+      "distill",
+      "chat",
+      tab.chatService ?? "unknown",
+      taskReaperOut.distill_mode ?? "logical",
+    ]
       .map((t) => `[[${t}]]`)
       .join(" ");
+
     const summaryContent = `${fm}
+
+## 要点
+${pointsMd}
+
+## 要約
+${taskReaperOut.summary || "（distill未取得）"}
+
+## 教訓・示唆
+${lessonsMd}
+
+## レイヤー判定
+${layerMd}
+
+## 蒸留結果
+${combinedDistillMd}
+
+### tags
+${tagsMd || "（未設定）"}
+
+---
+url: ${tab.url}
+raw_content: ${rawPath}
+created_at: ${new Date().toISOString()}
+raw_pagetitle: ${(tab.title || "").trim() || "（無題）"}
+linked_from: tabReaper
+---
+
+## 会話
+${conversationMd}
+`;
+    return { summaryFilename, summaryContent };
+  } catch {
+    try {
+      const prompt = `${buildChatDistillPrompt()}\n\n## 会話ログ\n${distillSource.slice(0, 30000)}`;
+      const ai = await callAI(provider, [{ role: "user", content: prompt }], {
+        apiKey,
+        model: modelId,
+        timeout: 90000,
+        maxTokens: 3500,
+        temperature: 0.25,
+      });
+      const json = parseChatDistillJson(ai.text || "");
+      const base =
+        getShortTitleForFilename(json.short_title) ||
+        generateShortTitle({ rawTitle: tab.title || "", url: tab.url });
+      const summaryFilename = `c-${base}_${uid}.md`;
+      const pointsMd = json.points.length > 0 ? json.points.map((p) => `- ${p}`).join("\n") : "- （distill未取得）";
+      const lessonsMd =
+        json.lessons.length > 0 ? json.lessons.map((p) => `- ${p}`).join("\n") : "- （distill未取得）";
+      const topicSolutionsMd =
+        json.topic_solutions.length > 0
+          ? json.topic_solutions.map((p) => `- ${p}`).join("\n")
+          : "- （distill未取得）";
+      const tagsMd = (json.tags || "")
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean)
+        .map((t) => `[[${t}]]`)
+        .join(" ");
+      const summaryContent = `${fm}
 
 ## 要点
 ${pointsMd}
@@ -1235,10 +1408,10 @@ linked_from: tabReaper
 ## 会話
 ${conversationMd}
 `;
-    return { summaryFilename, summaryContent };
-  } catch {
-    const summaryFilename = `p-chat_${uid}.md`;
-    const summaryContent = `${fm}
+      return { summaryFilename, summaryContent };
+    } catch {
+      const summaryFilename = `c-chat_${uid}.md`;
+      const summaryContent = `${fm}
 
 ## 要点
 - （distill未取得）
@@ -1246,7 +1419,8 @@ ${conversationMd}
 ## 会話
 ${conversationMd}
 `;
-    return { summaryFilename, summaryContent };
+      return { summaryFilename, summaryContent };
+    }
   }
 }
 
@@ -1482,9 +1656,10 @@ async function saveSelectedTabs() {
     const fromTextLinks = fromText.filter((u) => !hrefs.has(u)).map((u) => `[${u}](${u})`);
     tab.extractedUrls = [...links, ...fromTextLinks].slice(0, 30);
     if (bodyText != null && bodyText.length > 0) {
-      tab.rawFilename = `p-${base}_${uid}.txt`;
+      const rawPrefix = tab.chatService ? "c-" : detectSourceType(tab.url ?? "") === "x" ? "p-x-" : "p-";
+      tab.rawFilename = `${rawPrefix}${base}_${uid}.txt`;
       tab.rawContent = bodyText;
-      tab.rawContentPathForSummary = `${RAW_CONTENT_PATH_PREFIX}/p-${base}_${uid}.txt`;
+      tab.rawContentPathForSummary = `${RAW_CONTENT_PATH_PREFIX}/${rawPrefix}${base}_${uid}.txt`;
     } else {
       tab.rawContentPathForSummary = "（未設定）";
     }
@@ -1548,7 +1723,8 @@ async function saveSelectedTabs() {
         } catch (err) {
           console.error(`URL要約エラー (attempt ${attempt + 1}/${maxAttempts}):`, tab.url, err);
           if (attempt === maxAttempts - 1) {
-            tab.summaryFilename = `p-untitled_${tab.uid8 ?? uid8()}.md`;
+            const fallbackPrefix = detectSourceType(tab.url ?? "") === "x" ? "p-x-" : "p-";
+            tab.summaryFilename = `${fallbackPrefix}untitled_${tab.uid8 ?? uid8()}.md`;
             tab.summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary, wLabel);
             tab.summaryVaultDir = VAULT_CLIP_DIR;
           }
@@ -1604,9 +1780,5 @@ async function saveSelectedTabs() {
 function showStatus(message: string, type: "info" | "success" | "error") {
   statusEl.textContent = message;
   statusEl.className = `status show ${type}`;
-  if (type === "success") {
-    setTimeout(() => {
-      statusEl.className = "status";
-    }, 3000);
-  }
+  // success は消さず表示を残す（取り込み終了の確認のため）
 }
