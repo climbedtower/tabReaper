@@ -1319,12 +1319,19 @@ async function runChatDistillForTab(
     const points = pickGlobalThreePoints(taskReaperOut.summary || "", taskReaperOut.details || []);
     const lessons = taskReaperOut.details ?? [];
     const tags = ["distill", "chat", tab.chatService ?? "unknown", taskReaperOut.distill_mode ?? "logical"].join(" ");
-    const logicalForLogger = taskReaperOut.logical
-      ? {
-          actions: taskReaperOut.logical.actions.map((a) => ({ label: a.label, type: a.type, deadline: a.deadline })),
-          details: taskReaperOut.logical.details,
-        }
-      : undefined;
+    const logicalForLogger =
+      taskReaperOut.action != null
+        ? {
+            actions: taskReaperOut.action.actions.map((a: { label: string; type: string; deadline?: string }) => ({
+              label: a.label,
+              type: a.type,
+              deadline: a.deadline,
+            })),
+            details: taskReaperOut.action.details,
+          }
+        : taskReaperOut.logical != null
+          ? { actions: [] as Array<{ label: string; type: string; deadline?: string }>, details: taskReaperOut.logical.details }
+          : undefined;
     const emotionalForLogger = taskReaperOut.emotional;
     const phase1ForLogger = taskReaperOut.phase1
       ? {
