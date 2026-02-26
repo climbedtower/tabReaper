@@ -1325,23 +1325,8 @@ async function runChatDistillForTab(
     const titleSeed = (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
     const shortTitle =
       getShortTitleForFilename(titleSeed) || generateShortTitle({ rawTitle: titleSeed, url: tab.url });
-    const details = distillResult.action?.details ?? distillResult.logical?.details ?? [];
-    const points = pickGlobalThreePoints(taskReaperOut.summary || "", details);
-    const lessons = details;
-    const tags = ["distill", "chat", tab.chatService ?? "unknown", distillResult.mode ?? "logical"].join(" ");
-    const logicalForLogger =
-      taskReaperOut.actions != null && taskReaperOut.actions.length > 0
-        ? {
-            actions: taskReaperOut.actions.map((a: { label: string; type: string; deadline?: string }) => ({
-              label: a.label,
-              type: a.type,
-              deadline: a.deadline,
-            })),
-            details,
-          }
-        : distillResult.logical != null
-          ? { actions: [] as Array<{ label: string; type: string; deadline?: string }>, details: distillResult.logical.details }
-          : undefined;
+    const claim = distillResult.logical?.claim ?? "";
+    const topics = distillResult.logical?.topics ?? [];
     const emotionalForLogger = distillResult.emotional;
     const phase1ForLogger = distillResult.phase1
       ? {
@@ -1369,11 +1354,10 @@ async function runChatDistillForTab(
       rawChatPath,
       shortTitle,
       uid8: uid,
-      points,
+      claim,
       summary: taskReaperOut.summary ?? "",
-      lessons,
+      topics,
       conversationMd,
-      logical: logicalForLogger,
       emotional: emotionalForLogger,
       phase1: phase1ForLogger,
       extractionDomTurns: extraction.domTurns,
