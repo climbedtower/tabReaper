@@ -20,7 +20,7 @@ import {
 import { callAI } from "call-ai";
 import { logger } from "@pipelines/vault-logger";
 import { normalize, type ChatMessage } from "@pipelines/normalizer";
-import { process as runTaskReaperProcess } from "@pipelines/task-reaper";
+import { process as runTaskReaperProcess, runDistillForChat } from "@pipelines/task-reaper";
 import {
   loadRestConfig,
   healthCheck,
@@ -1295,53 +1295,63 @@ async function runChatDistillForTab(
   };
 
   try {
-    const taskReaperOut = await runTaskReaperProcess(
-      {
-        text: distillSource.slice(0, 30000),
-        mode: "task",
-        metadata: {
-          source_type: "chat",
-          title: tab.title || "",
-          url: tab.url,
-          service: tab.chatService ?? "unknown",
-        },
-        options: {
-          pipelineMode: "distill",
-          normalizedInput,
-        },
-      },
-      buildTaskReaperApiKeys(provider, apiKey)
-    );
+    const metadata = {
+      source_type: "chat" as const,
+      title: tab.title || "",
+      url: tab.url,
+      service: tab.chatService ?? "unknown",
+    };
+    const distillResult = await runDistillForChat({
+      text: distillSource.slice(0, 30000),
+      normalizedInput,
+      metadata,
+      apiKeys: buildTaskReaperApiKeys(provider, apiKey),
+    });
+
+    const taskReaperOut =
+      distillResult.action != null
+        ? await runTaskReaperProcess(
+            {
+              mode: "actions",
+              source: "distill",
+              distillOutput: distillResult.action,
+              normalizedInput,
+              metadata,
+            },
+            buildTaskReaperApiKeys(provider, apiKey)
+          )
+        : { mode: "actions" as const, summary: distillResult.summary, actions: [] };
 
     const titleSeed = (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
     const shortTitle =
       getShortTitleForFilename(titleSeed) || generateShortTitle({ rawTitle: titleSeed, url: tab.url });
-    const points = pickGlobalThreePoints(taskReaperOut.summary || "", taskReaperOut.details || []);
-    const lessons = taskReaperOut.details ?? [];
-    const tags = ["distill", "chat", tab.chatService ?? "unknown", taskReaperOut.distill_mode ?? "logical"].join(" ");
+    const details = distillResult.action?.details ?? distillResult.logical?.details ?? [];
+    const points = pickGlobalThreePoints(taskReaperOut.summary || "", details);
+    const lessons = details;
+    const tags = ["distill", "chat", tab.chatService ?? "unknown", distillResult.mode ?? "logical"].join(" ");
     const logicalForLogger =
-      taskReaperOut.action != null
+      taskReaperOut.actions != null && taskReaperOut.actions.length > 0
         ? {
-            actions: taskReaperOut.action.actions.map((a: { label: string; type: string; deadline?: string }) => ({
+            actions: taskReaperOut.actions.map((a: { label: string; type: string; deadline?: string }) => ({
               label: a.label,
               type: a.type,
               deadline: a.deadline,
             })),
-            details: taskReaperOut.action.details,
+            details,
           }
-        : taskReaperOut.logical != null
-          ? { actions: [] as Array<{ label: string; type: string; deadline?: string }>, details: taskReaperOut.logical.details }
+        : distillResult.logical != null
+          ? { actions: [] as Array<{ label: string; type: string; deadline?: string }>, details: distillResult.logical.details }
           : undefined;
-    const emotionalForLogger = taskReaperOut.emotional;
-    const phase1ForLogger = taskReaperOut.phase1
+    const emotionalForLogger = distillResult.emotional;
+    const phase1ForLogger = distillResult.phase1
       ? {
-          attribution_ledger: taskReaperOut.phase1.attribution_ledger.map((a) => ({
+          attribution_ledger: distillResult.phase1.attribution_ledger.map((a) => ({
             idea: a.idea,
             origin: a.origin,
             confidence: a.confidence,
             accepted: a.accepted,
           })),
-          anchor: taskReaperOut.phase1.anchor,
+          anchor: distillResult.phase1.anchor,
         }
       : undefined;
 
@@ -1349,7 +1359,7 @@ async function runChatDistillForTab(
       mode: "reference",
       sourceType: "chat",
       pipeline: "distill",
-      distillMode: taskReaperOut.distill_mode ?? "logical",
+      distillMode: distillResult.mode ?? "logical",
       rawPolicy: hasRaw ? "stored" : "url_only",
       date: todayDate(),
       window: windowLabel,
