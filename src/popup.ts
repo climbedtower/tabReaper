@@ -1302,7 +1302,7 @@ async function runChatDistillForTab(
       service: tab.chatService ?? "unknown",
     };
     const distillResult = await runDistillForChat({
-      text: distillSource.slice(0, 30000),
+      text: distillSource.slice(0, 80000),
       normalizedInput,
       metadata,
       apiKeys: buildTaskReaperApiKeys(provider, apiKey),
@@ -1385,7 +1385,7 @@ async function runChatDistillForTab(
     return { summaryFilename: out.filename, summaryContent: out.content, outputDir: out.outputDir };
   } catch {
     try {
-      const prompt = `${buildChatDistillPrompt()}\n\n## 会話ログ\n${distillSource.slice(0, 30000)}`;
+      const prompt = `${buildChatDistillPrompt()}\n\n## 会話ログ\n${distillSource.slice(0, 80000)}`;
       const ai = await callAI(provider, [{ role: "user", content: prompt }], {
         apiKey,
         model: modelId,
