@@ -974,9 +974,46 @@ function buildRawContentMd(
   return front + (bodyText || "");
 }
 
+const CHAT_FOOTER_PATTERNS = [
+  /^ツール\s*$/m,
+  /^Gemini\s.*間違えることがあります。?\s*$/m,
+  /^ChatGPT\s.*間違えることがあります。?\s*$/m,
+  /^Claude\s.*間違えることがあります。?\s*$/m,
+];
+
+function stripChatFooter(text: string): string {
+  let t = text;
+  for (const p of CHAT_FOOTER_PATTERNS) t = t.replace(p, "");
+  return t.trimEnd();
+}
+
 function formatChatTurns(messages: ChatMessage[]): string {
   if (messages.length === 0) return "";
-  return messages.map((m) => `### ${m.speaker}\n${m.text}`).join("\n\n");
+  return messages.map((m) => `### ${m.speaker}\n${stripChatFooter(m.text)}`).join("\n\n");
+}
+
+type AttributionItem = { idea: string; origin: string; evidence?: string; accepted?: string };
+type Phase1Like = { attribution_ledger: Array<{ idea: string; origin: string; confidence: string; accepted: string }>; anchor: unknown };
+
+function buildAttributionMd(
+  attributions: AttributionItem[] | undefined,
+  phase1: Phase1Like | undefined
+): string {
+  const sections: string[] = [];
+  if (attributions && attributions.length > 0) {
+    sections.push("## 帰属分析");
+    for (const a of attributions) {
+      sections.push(`- idea: ${a.idea} | origin: ${a.origin} | accepted: ${a.accepted ?? ""} | evidence: ${a.evidence ?? ""}`);
+    }
+  }
+  if (phase1?.attribution_ledger && phase1.attribution_ledger.length > 0) {
+    sections.push("");
+    sections.push("## 帰属台帳");
+    for (const a of phase1.attribution_ledger) {
+      sections.push(`- ${a.idea} (${a.origin}, ${a.confidence}) → ${a.accepted}`);
+    }
+  }
+  return sections.join("\n");
 }
 
 function buildChatDistillSource(messages: ChatMessage[], rawText: string): string {
@@ -1322,7 +1359,8 @@ async function runChatDistillForTab(
           )
         : { mode: "actions" as const, summary: distillResult.summary, actions: [] };
 
-    const titleSeed = (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
+    const logicalShortTitle = (distillResult.logical?.short_title || "").trim();
+    const titleSeed = logicalShortTitle || (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
     const shortTitle =
       getShortTitleForFilename(titleSeed) || generateShortTitle({ rawTitle: titleSeed, url: tab.url });
     const claim = distillResult.logical?.claim ?? "";
@@ -1339,6 +1377,9 @@ async function runChatDistillForTab(
           anchor: distillResult.phase1.anchor,
         }
       : undefined;
+
+    const attributionMd = buildAttributionMd(distillResult.emotional?.attributions, phase1ForLogger);
+    const fullConversationMd = attributionMd ? `${conversationMd}\n\n${attributionMd}` : conversationMd;
 
     const out = logger({
       mode: "reference",
@@ -1357,7 +1398,7 @@ async function runChatDistillForTab(
       claim,
       summary: taskReaperOut.summary ?? "",
       topics,
-      conversationMd,
+      conversationMd: fullConversationMd,
       emotional: emotionalForLogger,
       phase1: phase1ForLogger,
       extractionDomTurns: extraction.domTurns,
