@@ -1359,11 +1359,12 @@ async function runChatDistillForTab(
           )
         : { mode: "actions" as const, summary: distillResult.summary, actions: [] };
 
-    const logicalShortTitle = (distillResult.logical?.short_title || "").trim();
-    const titleSeed = logicalShortTitle || (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
+    const synthesisShortTitle = (distillResult.synthesis?.short_title || "").trim();
+    const titleSeed = synthesisShortTitle || (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
     const shortTitle =
       getShortTitleForFilename(titleSeed) || generateShortTitle({ rawTitle: titleSeed, url: tab.url });
-    const claim = distillResult.logical?.claim ?? "";
+    const claim = distillResult.synthesis?.claim ?? "";
+    const catchphrases = distillResult.synthesis?.catchphrases ?? [];
     const topics = distillResult.logical?.topics ?? [];
     const emotionalForLogger = distillResult.emotional;
     const phase1ForLogger = distillResult.phase1
@@ -1396,6 +1397,7 @@ async function runChatDistillForTab(
       shortTitle,
       uid8: uid,
       claim,
+      catchphrases,
       summary: taskReaperOut.summary ?? "",
       topics,
       conversationMd: fullConversationMd,
