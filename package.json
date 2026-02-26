@@ -8,7 +8,7 @@
     "dev": "vite build --watch"
   },
   "dependencies": {
-    "@pipelines/distill-logger": "file:../pipelines/distill-logger",
+    "@pipelines/vault-logger": "file:../pipelines/vault-logger",
     "@pipelines/normalizer": "file:../pipelines/normalizer",
     "@pipelines/task-reaper": "file:../pipelines/task-reaper",
     "@pipelines/url-summary": "file:../pipelines/url-summary",

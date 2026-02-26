@@ -18,7 +18,7 @@ import {
   type AIProvider,
 } from "ai-roles";
 import { callAI } from "call-ai";
-import { logger } from "@pipelines/distill-logger";
+import { logger } from "@pipelines/vault-logger";
 import { normalize, type ChatMessage } from "@pipelines/normalizer";
 import { process as runTaskReaperProcess } from "@pipelines/task-reaper";
 import {
