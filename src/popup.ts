@@ -315,7 +315,10 @@ function extractPageImagesInPage(): { src: string; alt: string; videoUrl?: strin
   return result.slice(0, 10);
 }
 
-/** ページコンテキストで実行。webchat から同期的にテキストを取得（待機・スクロールなし）。 */
+/** ページコンテキストで実行。webchat から同期的にテキストを取得（待機・スクロールなし）。
+ *  Gemini: main.innerText が仮想スクロールで空になる場合、document.body.innerText へフォールバック。
+ *  DOM セレクタ方式はバックグラウンドタブでレンダリングされないため使用不可（E｜20260224 参照）。
+ *  ターン分離・ノイズ除去は normalizer 側で実施。 */
 function extractWebchatInPage(): { service: string; rawText: string } {
   const host = location.hostname.toLowerCase();
   let service = "unknown";
@@ -325,7 +328,13 @@ function extractWebchatInPage(): { service: string; rawText: string } {
   const main = document.querySelector("main");
   const article = document.querySelector("article");
   const el = main ?? article ?? document.body;
-  const rawText = (el as HTMLElement | null)?.innerText?.trim() ?? "";
+  let rawText = (el as HTMLElement | null)?.innerText?.trim() ?? "";
+
+  if (service === "gemini" && rawText.length < 200) {
+    const bodyText = document.body.innerText?.trim() ?? "";
+    if (bodyText.length > rawText.length) rawText = bodyText;
+  }
+
   return { service, rawText };
 }
 
@@ -477,9 +486,9 @@ async function fetchChatContent(
   tabId: number,
   url: string,
   discarded: boolean
-): Promise<{ service: string; messages: ChatMessage[]; raw_text: string; extractionMeta: { domTurns: number } }> {
+): Promise<{ service: string; messages: ChatMessage[]; raw_text: string }> {
   if (isTabUninjectable(url, discarded)) {
-    return { service: "unknown", messages: [], raw_text: "", extractionMeta: { domTurns: 0 } };
+    return { service: "unknown", messages: [], raw_text: "" };
   }
   try {
     const extraction = chrome.scripting.executeScript({
@@ -500,11 +509,81 @@ async function fetchChatContent(
       service: (normalized.metadata.service as string) ?? "unknown",
       messages: normalized.messages,
       raw_text: normalized.raw_text,
-      extractionMeta: { domTurns: 0 },
     };
   } catch {
-    return { service: "unknown", messages: [], raw_text: "", extractionMeta: { domTurns: 0 } };
+    return { service: "unknown", messages: [], raw_text: "" };
   }
+}
+
+function isChatCaptureFailed(chat: {
+  service: string;
+  messages: ChatMessage[];
+  raw_text: string;
+}): { failed: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  const rawChars = (chat.raw_text || "").trim().length;
+  if (rawChars < 80) reasons.push("short_raw_text");
+  if ((chat.messages?.length ?? 0) === 0) reasons.push("zero_turns");
+  return { failed: reasons.length > 0, reasons };
+}
+
+function buildChatCaptureFailedSummaryMd(opts: {
+  tab: TabInfo;
+  windowLabel: string;
+  rawChatPath: string;
+  chat: { service: string; messages: ChatMessage[]; raw_text: string };
+  reasons: string[];
+}): string {
+  const rawPath = opts.tab.rawContentPathForSummary ?? "（未設定）";
+  const hasRaw = rawPath !== "（未設定）";
+  const extraction = {
+    domTurns: 0,
+    turns: opts.chat.messages.length,
+    rawChars: (opts.chat.raw_text || "").length,
+    partial: true,
+    warnings: [...opts.reasons, "capture_failed"],
+  };
+  const fm = buildChatReferenceFrontmatter({
+    url: opts.tab.url,
+    rawContentPath: rawPath,
+    rawChatPath: opts.rawChatPath,
+    windowLabel: opts.windowLabel,
+    hasRaw,
+    service: opts.tab.chatService ?? opts.chat.service ?? "unknown",
+    extraction,
+  });
+  return `${fm}
+
+## 要点
+- chat捕獲に失敗したため、distillを停止しました。
+- raw_chat を確認して再実行してください。
+- 理由: ${opts.reasons.join(", ")}
+
+## 要約
+会話の抽出品質が基準未満（capture_failed）だったため、誤要約を防ぐ目的で distill を実行していません。
+
+## 教訓・示唆
+- Gemini UI 変更や未描画状態で会話本文が取得できないことがある
+- partial 保存だけでは見落としやすいため、明示失敗として扱う
+
+## レイヤー判定
+capture_failed
+
+### tags
+[[distill]] [[chat]] [[capture_failed]]
+
+---
+url: ${opts.tab.url}
+raw_content: ${rawPath}
+raw_chat: ${opts.rawChatPath}
+created_at: ${new Date().toISOString()}
+raw_pagetitle: ${(opts.tab.title || "").trim() || "（無題）"}
+linked_from: tabReaper
+---
+
+## 会話
+${opts.chat.raw_text.slice(0, 20000)}
+`;
 }
 
 /** タイトルから装飾・サイト名を除去して内容のみ返す（" - Site" / " | Site" 等の後ろを落とす） */
@@ -1129,9 +1208,9 @@ async function runUrlSummaryForTab(
     const json = parseSummaryJson(raw);
     const shortTitle =
       getShortTitleForFilename(json.short_title) || generateShortTitle({ rawTitle: tab.title || "", url: tab.url });
-    const points = json.three_point ?? [];
+    const claim = (json.claim ?? "").trim() || undefined;
+    const structure = json.structure ?? [...(json.three_point ?? []), ...(json.how_to ?? [])].filter(Boolean);
     const summary = (json.shortSummary ?? json.summary ?? "").trim();
-    const lessons = json.how_to ?? [];
     const tags = (json.tags ?? "").trim();
     const out = logger({
       mode: "clip",
@@ -1144,9 +1223,9 @@ async function runUrlSummaryForTab(
       rawContentPath: rawPath,
       shortTitle,
       uid8: uid,
-      points,
+      claim,
+      structure,
       summary,
-      lessons,
       tags,
       extractedUrls: tab.extractedUrls,
     });
@@ -1169,7 +1248,7 @@ async function runChatDistillForTab(
   provider: AIProvider,
   modelId: string,
   windowLabel: string,
-  chatContent: { messages: ChatMessage[]; raw_text: string; extractionMeta: { domTurns: number } },
+  chatContent: { messages: ChatMessage[]; raw_text: string },
   rawChatPath: string
 ): Promise<{ summaryFilename: string; summaryContent: string; outputDir: string }> {
   const uid = tab.uid8 ?? uid8();
@@ -1186,7 +1265,7 @@ async function runChatDistillForTab(
   if (rawChars < 80) warnings.push("short_raw_text");
   if (Math.max(userCount, asstCount) >= 3 * Math.max(Math.min(userCount, asstCount), 1)) warnings.push("biased_roles");
   const extraction = {
-    domTurns: chatContent.extractionMeta.domTurns,
+    domTurns: 0,
     turns: turnsCount,
     rawChars,
     partial: warnings.length > 0,
@@ -1204,11 +1283,16 @@ async function runChatDistillForTab(
     extraction,
   });
 
-  const distillMessages = messages.map((m) => ({
-    turn: m.seq,
-    role: m.speaker,
-    text: m.text,
-  }));
+  const normalizedInput = {
+    messages,
+    metadata: {
+      source_type: "chat",
+      title: tab.title || "",
+      url: tab.url,
+      service: tab.chatService ?? "unknown",
+    },
+    raw_text: chatContent.raw_text,
+  };
 
   try {
     const taskReaperOut = await runTaskReaperProcess(
@@ -1223,7 +1307,7 @@ async function runChatDistillForTab(
         },
         options: {
           pipelineMode: "distill",
-          distillMessages,
+          normalizedInput,
         },
       },
       buildTaskReaperApiKeys(provider, apiKey)
@@ -1619,6 +1703,24 @@ async function saveSelectedTabs() {
         tab.chatRawFilename = `chat-${tab.chatService}_${uid}.md`;
         tab.chatRawContent = buildChatRawContentMd(chat.raw_text, tab.url, tab.chatService, createdAt);
         const rawChatPath = `${RAW_CONTENT_PATH_PREFIX}/${tab.chatRawFilename}`;
+        const captureCheck = isChatCaptureFailed(chat);
+        if (captureCheck.failed) {
+          showStatus(
+            `chat捕獲失敗 (${i + 1}/${total}): ${captureCheck.reasons.join(", ")}。distill停止`,
+            "error"
+          );
+          const summaryFilename = `c-capture_failed_${uid}.md`;
+          tab.summaryFilename = summaryFilename;
+          tab.summaryContent = buildChatCaptureFailedSummaryMd({
+            tab,
+            windowLabel: wLabel,
+            rawChatPath,
+            chat,
+            reasons: captureCheck.reasons,
+          });
+          tab.summaryVaultDir = VAULT_REFERENCE_DIR;
+          continue;
+        }
         showStatus(`distill中 (${i + 1}/${total})...`, "info");
         const out = await runChatDistillForTab(
           tab,
