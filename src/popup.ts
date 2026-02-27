@@ -37,6 +37,7 @@ const RAW_CONTENT_PATH_PREFIX = "memory/raw_content";
 const VAULT_IMAGE_DIR = "memory/raw_content/img";
 const SHORT_TITLE_MAX_LEN = 60;
 const WINDOW_LABEL_MAX_LEN = 40;
+const RAW_CONTENT_MIN_CHARS = 3000;
 
 const TWITTER_HOST_RE = /^(https?:\/\/)?(www\.)?(twitter\.com|x\.com)(\/|$)/i;
 const YOUTUBE_HOST_RE = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)(\/|$)/i;
@@ -678,6 +679,8 @@ interface TabInfo {
   chatService?: ChatService;
   pageImageUrls?: { src: string; alt: string; videoUrl?: string }[];
   capturedImages?: { filename: string; alt: string; videoUrl?: string }[];
+  /** chat 蒸留失敗時のみ。day-index は URL のみ・タブ背景赤表示用 */
+  distillFailed?: boolean;
 }
 
 let allWindows: { id: number; tabs: TabInfo[]; label: string; labelFromSelection?: boolean; captureImages?: boolean }[] = [];
@@ -826,6 +829,7 @@ function renderTabList() {
     win.tabs.forEach((tab) => {
       const tabItem = document.createElement("div");
       tabItem.className = "tab-item";
+      if (tab.distillFailed) tabItem.classList.add("tab-failed");
       const tabCheckbox = document.createElement("input");
       tabCheckbox.type = "checkbox";
       tabCheckbox.id = `tab-${tab.id}`;
@@ -1362,7 +1366,7 @@ async function runChatDistillForTab(
   windowLabel: string,
   chatContent: { messages: ChatMessage[]; raw_text: string },
   rawChatPath: string
-): Promise<{ summaryFilename: string; summaryContent: string; outputDir: string }> {
+): Promise<{ summaryFilename: string; summaryContent: string; outputDir: string } | null> {
   const uid = tab.uid8 ?? uid8();
   const messages = chatContent.messages;
   const conversationMd =
@@ -1406,158 +1410,91 @@ async function runChatDistillForTab(
     raw_text: chatContent.raw_text,
   };
 
-  try {
-    const metadata = {
-      source_type: "chat" as const,
-      title: tab.title || "",
-      url: tab.url,
-      service: tab.chatService ?? "unknown",
-    };
-    const distillResult = await runDistillForChat({
-      text: distillSource.slice(0, 80000),
-      normalizedInput,
-      metadata,
-      apiKeys: buildTaskReaperApiKeys(provider, apiKey),
-    });
-
-    const taskReaperOut =
-      distillResult.action != null
-        ? await runTaskReaperProcess(
-            {
-              mode: "actions",
-              source: "distill",
-              distillOutput: distillResult.action,
-              normalizedInput,
-              metadata,
-            },
-            buildTaskReaperApiKeys(provider, apiKey)
-          )
-        : { mode: "actions" as const, summary: distillResult.summary, actions: [] };
-
-    const synthesisShortTitle = (distillResult.synthesis?.short_title || "").trim();
-    const titleSeed = synthesisShortTitle || (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
-    const shortTitle =
-      getShortTitleForFilename(titleSeed) || generateShortTitle({ rawTitle: titleSeed, url: tab.url });
-    const claim = distillResult.synthesis?.claim ?? "";
-    const catchphrases = distillResult.synthesis?.catchphrases ?? [];
-    const topics = distillResult.logical?.topics ?? [];
-    const emotionalForLogger = distillResult.emotional;
-    const phase1ForLogger = distillResult.phase1
-      ? {
-          attribution_ledger: distillResult.phase1.attribution_ledger.map((a) => ({
-            idea: a.idea,
-            origin: a.origin,
-            confidence: a.confidence,
-            accepted: a.accepted,
-          })),
-          anchor: distillResult.phase1.anchor,
-        }
-      : undefined;
-
-    const attributionMd = buildAttributionMd(distillResult.emotional?.attributions, phase1ForLogger);
-    const fullConversationMd = attributionMd ? `${conversationMd}\n\n${attributionMd}` : conversationMd;
-
-    const out = logger({
-      mode: "reference",
-      sourceType: "chat",
-      pipeline: "distill",
-      distillMode: distillResult.mode ?? "logical",
-      rawPolicy: hasRaw ? "stored" : "url_only",
-      date: todayDate(),
-      window: windowLabel,
-      service: tab.chatService ?? "unknown",
-      url: tab.url ?? "",
-      rawContentPath: rawPath,
-      rawChatPath,
-      shortTitle,
-      uid8: uid,
-      claim,
-      catchphrases,
-      summary: taskReaperOut.summary ?? "",
-      topics,
-      conversationMd: fullConversationMd,
-      emotional: emotionalForLogger,
-      phase1: phase1ForLogger,
-      extractionDomTurns: extraction.domTurns,
-      extractionTurns: extraction.turns,
-      extractionRawChars: extraction.rawChars,
-      extractionPartial: extraction.partial,
-      extractionWarnings: extraction.warnings,
-    });
-    return { summaryFilename: out.filename, summaryContent: out.content, outputDir: out.outputDir };
-  } catch {
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const prompt = `${buildChatDistillPrompt()}\n\n## 会話ログ\n${distillSource.slice(0, 80000)}`;
-      const ai = await callAI(provider, [{ role: "user", content: prompt }], {
-        apiKey,
-        model: modelId,
-        timeout: 90000,
-        maxTokens: 3500,
-        temperature: 0.25,
+      const metadata = {
+        source_type: "chat" as const,
+        title: tab.title || "",
+        url: tab.url,
+        service: tab.chatService ?? "unknown",
+      };
+      const distillResult = await runDistillForChat({
+        text: distillSource.slice(0, 80000),
+        normalizedInput,
+        metadata,
+        apiKeys: buildTaskReaperApiKeys(provider, apiKey),
       });
-      const json = parseChatDistillJson(ai.text || "");
-      const base =
-        getShortTitleForFilename(json.short_title) ||
-        generateShortTitle({ rawTitle: tab.title || "", url: tab.url });
-      const summaryFilename = `c-${base}_${uid}.md`;
-      const pointsMd = json.points.length > 0 ? json.points.map((p) => `- ${p}`).join("\n") : "- （distill未取得）";
-      const lessonsMd =
-        json.lessons.length > 0 ? json.lessons.map((p) => `- ${p}`).join("\n") : "- （distill未取得）";
-      const topicSolutionsMd =
-        json.topic_solutions.length > 0
-          ? json.topic_solutions.map((p) => `- ${p}`).join("\n")
-          : "- （distill未取得）";
-      const tagsMd = (json.tags || "")
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean)
-        .map((t) => `[[${t}]]`)
-        .join(" ");
-      const summaryContent = `${fm}
 
-## 要点
-${pointsMd}
+      const taskReaperOut =
+        distillResult.action != null
+          ? await runTaskReaperProcess(
+              {
+                mode: "actions",
+                source: "distill",
+                distillOutput: distillResult.action,
+                normalizedInput,
+                metadata,
+              },
+              buildTaskReaperApiKeys(provider, apiKey)
+            )
+          : { mode: "actions" as const, summary: distillResult.summary, actions: [] };
 
-## 要約
-${json.summary || "（distill未取得）"}
+      const synthesisShortTitle = (distillResult.synthesis?.short_title || "").trim();
+      const titleSeed = synthesisShortTitle || (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
+      const shortTitle =
+        getShortTitleForFilename(titleSeed) || generateShortTitle({ rawTitle: titleSeed, url: tab.url });
+      const claim = distillResult.synthesis?.claim ?? "";
+      const catchphrases = distillResult.synthesis?.catchphrases ?? [];
+      const topics = distillResult.logical?.topics ?? [];
+      const emotionalForLogger = distillResult.emotional;
+      const phase1ForLogger = distillResult.phase1
+        ? {
+            attribution_ledger: distillResult.phase1.attribution_ledger.map((a) => ({
+              idea: a.idea,
+              origin: a.origin,
+              confidence: a.confidence,
+              accepted: a.accepted,
+            })),
+            anchor: distillResult.phase1.anchor,
+          }
+        : undefined;
 
-## 教訓・示唆
-${lessonsMd}
+      const attributionMd = buildAttributionMd(distillResult.emotional?.attributions, phase1ForLogger);
+      const fullConversationMd = attributionMd ? `${conversationMd}\n\n${attributionMd}` : conversationMd;
 
-## 詳細要約
-${json.longSummary || "（distill未取得）"}
-
-## 話題と解決法
-${topicSolutionsMd}
-
-### tags
-${tagsMd || "（未設定）"}
-
----
-url: ${tab.url}
-raw_content: ${rawPath}
-created_at: ${new Date().toISOString()}
-raw_pagetitle: ${(tab.title || "").trim() || "（無題）"}
-linked_from: tabReaper
----
-
-## 会話
-${conversationMd}
-`;
-      return { summaryFilename, summaryContent, outputDir: VAULT_REFERENCE_DIR };
-    } catch {
-      const summaryFilename = `c-chat_${uid}.md`;
-      const summaryContent = `${fm}
-
-## 要点
-- （distill未取得）
-
-## 会話
-${conversationMd}
-`;
-      return { summaryFilename, summaryContent, outputDir: VAULT_REFERENCE_DIR };
+      const out = logger({
+        mode: "reference",
+        sourceType: "chat",
+        pipeline: "distill",
+        distillMode: distillResult.mode ?? "logical",
+        rawPolicy: hasRaw ? "stored" : "url_only",
+        date: todayDate(),
+        window: windowLabel,
+        service: tab.chatService ?? "unknown",
+        url: tab.url ?? "",
+        rawContentPath: rawPath,
+        rawChatPath,
+        shortTitle,
+        uid8: uid,
+        claim,
+        catchphrases,
+        summary: taskReaperOut.summary ?? "",
+        topics,
+        conversationMd: fullConversationMd,
+        emotional: emotionalForLogger,
+        phase1: phase1ForLogger,
+        extractionDomTurns: extraction.domTurns,
+        extractionTurns: extraction.turns,
+        extractionRawChars: extraction.rawChars,
+        extractionPartial: extraction.partial,
+        extractionWarnings: extraction.warnings,
+      });
+      return { summaryFilename: out.filename, summaryContent: out.content, outputDir: out.outputDir };
+    } catch (err) {
+      console.error(`chat distill error (attempt ${attempt + 1}/2):`, tab.url, err);
     }
   }
+  return null;
 }
 
 function getSelectedTabsByWindow(): {
@@ -1794,9 +1731,14 @@ async function saveSelectedTabs() {
     tab.extractedUrls = [...links, ...fromTextLinks].slice(0, 30);
     if (bodyText != null && bodyText.length > 0) {
       const rawPrefix = tab.chatService ? "c-" : detectSourceType(tab.url ?? "") === "x" ? "p-x-" : "p-";
-      tab.rawFilename = `${rawPrefix}${base}_${uid}.txt`;
-      tab.rawContent = bodyText;
-      tab.rawContentPathForSummary = `${RAW_CONTENT_PATH_PREFIX}/${rawPrefix}${base}_${uid}.txt`;
+      const shouldStoreRaw = !!tab.chatService || bodyText.length >= RAW_CONTENT_MIN_CHARS;
+      if (shouldStoreRaw) {
+        tab.rawFilename = `${rawPrefix}${base}_${uid}.txt`;
+        tab.rawContent = bodyText;
+        tab.rawContentPathForSummary = `${RAW_CONTENT_PATH_PREFIX}/${rawPrefix}${base}_${uid}.txt`;
+      } else {
+        tab.rawContentPathForSummary = "（未設定）";
+      }
     } else {
       tab.rawContentPathForSummary = "（未設定）";
     }
@@ -1811,6 +1753,7 @@ async function saveSelectedTabs() {
   const tabWindowLabel = new Map<number, string>();
   byWindow.forEach((w) => w.tabs.forEach((t) => tabWindowLabel.set(t.id, w.windowLabel)));
 
+  const distillFailedTabIds = new Set<number>();
   if (workerModel && apiKey) {
     for (let i = 0; i < flatTabs.length; i++) {
       const tab = flatTabs[i];
@@ -1851,6 +1794,11 @@ async function saveSelectedTabs() {
           chat,
           rawChatPath
         );
+        if (out === null) {
+          distillFailedTabIds.add(tab.id);
+          tab.distillFailed = true;
+          continue;
+        }
         tab.summaryFilename = out.summaryFilename;
         tab.summaryContent = out.summaryContent;
         tab.summaryVaultDir = out.outputDir;
@@ -1923,8 +1871,15 @@ async function saveSelectedTabs() {
   try {
     await saveRawToVault(restCfg, byWindow);
     const failedSummaryTabIds = await saveTabSummariesToVault(restCfg, byWindow);
-    await appendDayIndex(restCfg, byWindow, new Date(), failedSummaryTabIds);
-    showStatus("library/clip・library/reference に保存しました", "success");
+    const allFailedIds = new Set([...failedSummaryTabIds, ...distillFailedTabIds]);
+    await appendDayIndex(restCfg, byWindow, new Date(), allFailedIds);
+    const failCount = distillFailedTabIds.size;
+    if (failCount > 0) {
+      showStatus(`保存完了（distill失敗 ${failCount}件: URLのみ記録）`, "error");
+    } else {
+      showStatus("library/clip・library/reference に保存しました", "success");
+    }
+    renderTabList();
     // 取り込み終了状態でポップアップは開いたままにする（自動で閉じない）
   } catch (e) {
     showStatus(`保存エラー: ${(e as Error).message}`, "error");

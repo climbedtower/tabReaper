@@ -223,3 +223,8 @@ button:disabled {
   max-height: 40px;
   overflow: hidden;
 }
+
+.tab-item.tab-failed {
+  background: #ffebee;
+  border-left-color: #c62828;
+}
