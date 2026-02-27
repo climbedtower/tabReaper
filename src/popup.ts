@@ -151,6 +151,27 @@ function extractBodyTextAndLinksInPage(): { bodyText: string; links: string[] } 
 }
 
 /**
+ * ページコンテキストで実行。見出し（h1-h4）を抽出して返す。
+ * analysis モードの Phase 1 切り分け用。
+ */
+function extractHeadingsInPage(): Array<{ level: number; text: string }> {
+  const main = document.querySelector("main");
+  const article = document.querySelector("article");
+  const root = main ?? article ?? document.body;
+  if (!root) return [];
+  const headingEls = Array.from(root.querySelectorAll("h1, h2, h3, h4"));
+  const headings = headingEls
+    .map((el) => {
+      const tag = (el.tagName || "").toLowerCase();
+      const level = Number(tag.replace("h", "")) || 0;
+      const text = (el.textContent || "").trim().replace(/\s+/g, " ");
+      return { level, text };
+    })
+    .filter((h) => h.level >= 1 && h.level <= 4 && h.text.length > 0);
+  return headings.slice(0, 40);
+}
+
+/**
  * ページコンテキストで実行。ページ内の主要な画像・動画サムネイルURLを抽出して返す。
  * Twitter/X: ツイート添付画像 + 動画poster
  * YouTube: ページ or 埋め込みのサムネイル
@@ -482,6 +503,33 @@ async function fetchTabBodyAndLinks(
   }
 }
 
+/** 選択タブの見出し情報を取得（analysis モード用）。取得不可時は空配列 */
+async function fetchTabHeadings(
+  tabId: number,
+  url: string,
+  discarded: boolean
+): Promise<Array<{ level: number; text: string }>> {
+  if (isTabUninjectable(url, discarded)) return [];
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: extractHeadingsInPage,
+    });
+    const rows = result?.[0]?.result;
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .map((r) => r as { level?: unknown; text?: unknown })
+      .map((r) => ({
+        level: typeof r.level === "number" ? r.level : 0,
+        text: typeof r.text === "string" ? r.text.trim() : "",
+      }))
+      .filter((r) => r.level >= 1 && r.level <= 4 && r.text.length > 0)
+      .slice(0, 40);
+  } catch {
+    return [];
+  }
+}
+
 async function fetchChatContent(
   tabId: number,
   url: string,
@@ -623,6 +671,8 @@ interface TabInfo {
   rawContentPathForSummary?: string;
   /** 本文中に言及された URL（要点リスト末尾に追記用） */
   extractedUrls?: string[];
+  /** analysis モードの切り分けに使う見出し情報 */
+  headings?: Array<{ level: number; text: string }>;
   uid8?: string;
   baseForFilename?: string;
   chatService?: ChatService;
@@ -1220,18 +1270,33 @@ async function runUrlSummaryForTab(
   windowLabel: string,
 ): Promise<{ summaryFilename: string; summaryContent: string; outputDir: string }> {
   const uid = tab.uid8 ?? uid8();
-  const created = new Date().toISOString();
-  let text: string;
-  if (isTwitterUrl(tab.url)) {
-    const threadText = await fetchTwitterThreadText(tab.id);
-    text = (threadText && threadText.length > 0 ? threadText : null) ?? (await fetchViaJina(tab.url, 15000));
-  } else {
-    text = await fetchViaJina(tab.url, 15000);
-  }
   const rawPath = tab.rawContentPathForSummary ?? "（未設定）";
   const hasRaw = rawPath !== "（未設定）";
   const sourceType = detectSourceType(tab.url ?? "");
   const st: "web" | "x" | "youtube" | "paper" | "chat" = sourceType === "blog" ? "web" : sourceType;
+
+  if (st === "youtube") {
+    const clipPrefix = "p-";
+    const summaryFilename = `${clipPrefix}untitled_${uid}.md`;
+    const summaryContent = buildPlaceholderSummaryMd(tab, tab.rawContentPathForSummary, windowLabel);
+    return { summaryFilename, summaryContent, outputDir: VAULT_CLIP_DIR };
+  }
+
+  const mode: "summary" | "analysis" = st === "web" || st === "paper" ? "analysis" : "summary";
+  const rawExtractedText = (tab.rawContent || "").trim();
+  let text = rawExtractedText;
+  if (!text) {
+    if (isTwitterUrl(tab.url)) {
+      const threadText = await fetchTwitterThreadText(tab.id);
+      text = (threadText && threadText.length > 0 ? threadText : null) ?? (await fetchViaJina(tab.url, 15000));
+    } else {
+      text = await fetchViaJina(tab.url, 15000);
+    }
+  } else if (isTwitterUrl(tab.url) && mode === "summary") {
+    // x はスレッド抽出を優先し、取れなければ本文抽出/最終的に Jina へフォールバック
+    const threadText = await fetchTwitterThreadText(tab.id);
+    text = (threadText && threadText.length > 0 ? threadText : rawExtractedText) || (await fetchViaJina(tab.url, 15000));
+  }
 
   try {
     const raw = await generateSummaryJson({
@@ -1240,13 +1305,20 @@ async function runUrlSummaryForTab(
       apiKey,
       provider,
       model: modelId,
+      mode,
+      sourceType: st,
+      headings: tab.headings,
       timeout: 90000,
     });
     const json = parseSummaryJson(raw);
     const shortTitle =
       getShortTitleForFilename(json.short_title) || generateShortTitle({ rawTitle: tab.title || "", url: tab.url });
     const claim = (json.claim ?? "").trim() || undefined;
-    const structure = json.structure ?? [...(json.three_point ?? []), ...(json.how_to ?? [])].filter(Boolean);
+    const topics = json.topics ?? (json.structure
+      ? [{ topic: "要点", points: json.structure.filter(Boolean) }]
+      : [...(json.three_point ?? []), ...(json.how_to ?? [])].filter(Boolean).length > 0
+        ? [{ topic: "要点", points: [...(json.three_point ?? []), ...(json.how_to ?? [])].filter(Boolean) }]
+        : []);
     const summary = (json.shortSummary ?? json.summary ?? "").trim();
     const tags = (json.tags ?? "").trim();
     const out = logger({
@@ -1261,7 +1333,10 @@ async function runUrlSummaryForTab(
       shortTitle,
       uid8: uid,
       claim,
-      structure,
+      topics,
+      catchphrases: json.catchphrases,
+      credibility: json.credibility,
+      howTo: json.how_to,
       summary,
       tags,
       extractedUrls: tab.extractedUrls,
@@ -1712,6 +1787,7 @@ async function saveSelectedTabs() {
       tab.url,
       false
     );
+    tab.headings = await fetchTabHeadings(tab.id, tab.url, false);
     const fromText = bodyText ? extractUrlsFromText(bodyText) : [];
     const hrefs = new Set(links.map(hrefFromObsidianLink).filter((h): h is string => h != null));
     const fromTextLinks = fromText.filter((u) => !hrefs.has(u)).map((u) => `[${u}](${u})`);
