@@ -20,7 +20,8 @@ import {
 import { callAI } from "call-ai";
 import { logger } from "@pipelines/vault-logger";
 import { normalize, type ChatMessage } from "@pipelines/normalizer";
-import { process as runTaskReaperProcess, runDistillForChat } from "@pipelines/task-reaper";
+import { process as runTaskReaperProcess } from "@pipelines/task-reaper";
+import { runDistill } from "@pipelines/distill-filter";
 import {
   loadRestConfig,
   healthCheck,
@@ -1140,6 +1141,39 @@ function buildTaskReaperApiKeys(provider: AIProvider, apiKey: string): APIKeySet
   return keys;
 }
 
+async function runChatDistillPipeline(input: {
+  text: string;
+  metadata?: { title?: string; [key: string]: unknown };
+  provider: AIProvider;
+  modelId: string;
+  apiKey: string;
+}): Promise<Awaited<ReturnType<typeof runDistill>>> {
+  const chatComplete = async (
+    _role: string,
+    messages: Array<{ role: string; content: string }>,
+    systemPrompt?: string
+  ): Promise<string> => {
+    const res = await callAI(input.provider, messages, {
+      apiKey: input.apiKey,
+      model: input.modelId,
+      timeout: 60000,
+      maxTokens: 3000,
+      temperature: 0.2,
+      ...(systemPrompt ? { system: systemPrompt } : {}),
+    });
+    return (res.text || "").trim();
+  };
+
+  return runDistill(
+    {
+      text: input.text,
+      mode: "chat",
+      metadata: input.metadata,
+    },
+    chatComplete
+  );
+}
+
 type ChatDistillJson = {
   short_title: string;
   points: string[];
@@ -1418,11 +1452,12 @@ async function runChatDistillForTab(
         url: tab.url,
         service: tab.chatService ?? "unknown",
       };
-      const distillResult = await runDistillForChat({
+      const distillResult = await runChatDistillPipeline({
         text: distillSource.slice(0, 80000),
-        normalizedInput,
         metadata,
-        apiKeys: buildTaskReaperApiKeys(provider, apiKey),
+        provider,
+        modelId,
+        apiKey,
       });
 
       const taskReaperOut =
@@ -1437,7 +1472,11 @@ async function runChatDistillForTab(
               },
               buildTaskReaperApiKeys(provider, apiKey)
             )
-          : { mode: "actions" as const, summary: distillResult.summary, actions: [] };
+          : {
+              mode: "actions" as const,
+              summary: distillResult.summary || distillResult.synthesis?.summary || "（要約なし）",
+              actions: [],
+            };
 
       const synthesisShortTitle = (distillResult.synthesis?.short_title || "").trim();
       const titleSeed = synthesisShortTitle || (taskReaperOut.summary || "").trim() || (tab.title || "").trim();
